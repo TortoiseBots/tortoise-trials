@@ -1227,8 +1227,11 @@ class Run:
         One worker runs a trial's reps in order (rep1, rep2, ...), so the finished rep
         dirs (`rep1` .. `rep{rep_index-1}`) are this trial's own earlier reps; the last
         `Restore Mana` cast in the newest one with any is the wall clock the item
-        cooldown runs from. No potion anywhere yet (or an unreadable rep dir) means no
-        wait. The wait is bounded (one gap, then the rep starts) and logged.
+        cooldown runs from. The dirs are ordered NUMERICALLY (rep2 before rep10: a string
+        sort put rep10 first and rep2's older wall overwrote its newer potion) and the
+        newest potion across all of them wins. No potion anywhere yet (or an unreadable
+        rep dir) means no wait. The wait is bounded (one gap, then the rep starts) and
+        logged.
         """
         import glob as _glob
         import json as _json
@@ -1237,11 +1240,15 @@ class Run:
         if not gap_s or gap_s <= 0:
             return 0.0
         trial_dir = os.path.join(self.run_dir, trial.get("id"))
+
+        def rep_no(path):
+            m = re.search(r"rep(\d+)$", os.path.basename(path))
+            return int(m.group(1)) if m else -1
         last_wall = None
-        for path in sorted(_glob.glob(os.path.join(trial_dir, "rep*"))):
+        for path in sorted(_glob.glob(os.path.join(trial_dir, "rep*")), key=rep_no):
             try:
-                marks = [_json.loads(l) for l in open(os.path.join(path, "marks.jsonl"))
-                         if l.strip()]
+                with open(os.path.join(path, "marks.jsonl")) as f:
+                    marks = [_json.loads(l) for l in f if l.strip()]
             except OSError:
                 continue
             base = None
@@ -1263,16 +1270,17 @@ class Run:
             if base is None:
                 continue
             try:
-                rows = [_json.loads(l) for l in open(os.path.join(path, "events.jsonl"))
-                        if l.strip()]
+                with open(os.path.join(path, "events.jsonl")) as f:
+                    rows = [_json.loads(l) for l in f if l.strip()]
             except OSError:
                 continue
             for row in rows:
                 if row.get("kind") == "cast" and row.get("spell") == "Restore Mana":
                     try:
-                        last_wall = base + float(row.get("t") or 0.0)
+                        cast_wall = base + float(row.get("t") or 0.0)
                     except (TypeError, ValueError):
                         continue
+                    last_wall = cast_wall if last_wall is None else max(last_wall, cast_wall)
         if last_wall is None:
             return 0.0
         wait = float(gap_s) - (_time.time() - last_wall)

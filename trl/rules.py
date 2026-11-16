@@ -1195,17 +1195,21 @@ def evaluate(rule, rows, samples, marks, ctx):
             except (TypeError, ValueError):
                 cooldown = 0.0
             if cooldown > 0:
-                ordered = sorted(matches, key=lambda r: float(r.get("t", 0.0) or 0.0))
+                # the carried-over hit is a REAL hit outside the spans: a cast stamped inside
+                # an earlier rep's cooldown is impossible (or a proc row), so it is never the
+                # rep's first chance and must not become `ordered[0]` — that skipped the
+                # carryover and scored the real first potion (just past expiry) as a late miss.
+                outside = [r for r in scored(matches)
+                           if not any(a <= float(r.get("t", 0.0) or 0.0) <= b for (a, b) in cool)]
+                ordered = sorted(outside, key=lambda r: float(r.get("t", 0.0) or 0.0))
                 if ordered:
                     first_t = float(ordered[0].get("t", 0.0) or 0.0)
                     # the previous rep's last hit on this rep's base: each span is
                     # [prev_hit, prev_hit + cooldown], so prev_hit = b - cooldown.
                     prev_last = max((b - cooldown for (a, b) in cool), default=None)
-                    inside = any(a <= first_t <= b for (a, b) in cool)
-                    if prev_last is not None and not inside and first_t - prev_last <= cooldown + 1.0:
+                    if prev_last is not None and first_t - prev_last <= cooldown + 1.0:
                         # the whole rep rode the carried-over cooldown: INCONCLUSIVE with
-                        # the brief's reason, never a miss on the second potion. (The old
-                        # inside an earlier cooldown there is impossible or a proc row.)
+                        # the brief's reason, never a miss on the second potion.
                         first = ordered[0]
                         return {"value": first.get("t", 0.0), "no_match": False, "k": 0, "n": 0,
                                 "verdict": "INCONCLUSIVE",
