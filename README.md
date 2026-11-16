@@ -116,7 +116,13 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
   `top_up_to_pct` (a number inside the band, not for ooc kinds) drops the governor's top-up to that
   percent instead of the band middle. `reset_hire_cooldowns: true` clears the hire's cooldowns before
   the first summon (check `hire_cooldowns_reset`; it does NOT clear an item cooldown such as Thistle
-  Tea's). `energy_drain {first_at_s 5-170, every_s >= 20, to 0-19}` (rogue `tank_damage` only)
+  Tea's). `min_rep_gap_s` (a number of seconds > 0) waits between the previous repeat's last
+  `Restore Mana` potion wall time and the next repeat's start, so a rep never opens inside the
+  120 s Greater Mana Potion item cooldown the per-rep `.cooldown` cannot reset (the potion trial
+  carries 130). A rep whose first potion still lands within one cooldown (+1 s sampler grace)
+  of the previous rep's last potion scores INCONCLUSIVE with reason `item cooldown from rep N-1`,
+  never a late-cast miss; only the earliest potion of each rep can be the carried-over one.
+  `energy_drain {first_at_s 5-170, every_s >= 20, to 0-19}` (rogue `tank_damage` only)
   empties the hire's bar on schedule with `energy_drain` marks, stamped at the `.modify energy` send.
   `prepull_unaura: [<aura id>, ...]` strips those auras off the hire before the pull: the hire is
   reused between repeats, so a form an earlier repeat cast (e.g. Shadowform 15473) would otherwise
