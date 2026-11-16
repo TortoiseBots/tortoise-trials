@@ -16,9 +16,7 @@
     },
     "stance": 71,
     "forced_role": null,
-    "auras": [
-      770
-    ],
+    "auras": [],
     "items": []
   },
   "bot": {
@@ -69,8 +67,7 @@
     "bot_items",
     "grouped",
     "mobs_ready",
-    "config_read",
-    "player_auras"
+    "config_read"
   ],
   "duration_s": 180,
   "repeats": 2,
