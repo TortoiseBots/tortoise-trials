@@ -8,17 +8,25 @@ Two bench bugs behind the rc1116 recheck, both deterministic setup/scoring artef
 
 **Dispel-magic: the 770 debuff never lands.** `check_stance` runs `.unaura all` before casting
 Defensive Stance (71), and the wanted-auras step sent `.aura 770` without proving it afterwards:
-all 6 recheck reps held 71 with 770 missing (`setup INVALID (auras [71]; missing [770])`). Two-part
-fix, no new GM command (the brief forbids it; the runner already has the mechanism): `Situation.run`
-applies the `debuff` AFTER the summon and pull (was: before the `pull_after_s` wait, i.e. before the
-pull's selection moves), and `check_player_auras` sends the wanted auras after the stance step ran,
-waits for them to land and re-sends a still-missing aura once (the runner's retry pattern, like
-`check_talents`' missing-spell re-learn). A missing aura after the retry fails the row, never a
-silent score. `tests/test_bench_fix_1116.py::DispelSetupOrderTest` pins the retry (lost first 770
-send -> two `.aura 770` lines, proven 71+770; a stub that swallows 770 -> row fails) and the order
-(the debuff apply sits after `self.pull()` in `run`). Live proof needs a server run (offline: the
-old shape is the recheck's own marks — `.unaura all` at t 3.98, `.aura 770` at 4.32/4.37, read-back
-`auras [71]`).
+all 6 recheck reps held 71 with 770 missing (`setup INVALID (auras [71]; missing [770])`). Round 1
+of the review found two holes in the first fix: the trial still listed 770 as a setup aura, so it
+was already up at the pull and the post-pull `.aura` only REFRESHED it (no `aura_on` for the rule,
+Codex HIGH), and `check_player_auras` ignored its `timeout` and read back at once, so a late-landing
+aura failed setup (agy HIGH). Final shape, no new GM command: 770 is the trial's TESTED debuff, not
+a setup aura (the trial file's `player.auras` is empty). `check_player_auras` sends the wanted setup
+auras after the stance step, polls until each is up (bounded by `timeout`, like `check_stance`) and
+re-sends only a still-missing one once, polling again. `Situation.strip_debuff` runs just before the
+pull: it proves 770 absent from a fresh victim aura read and `.unaura 770`s a leftover copy, ending
+the repeat INVALID when absence cannot be proven. `Situation.apply_debuff` runs after the pull (in
+combat), takes the event-log cursor before the send, applies `.aura 770` and requires a fresh
+`aura_applied` row for 770 on the victim past that cursor; one more apply when the first event never
+shows, then the repeat is INVALID (`no fresh aura_on ...`) instead of scoring a repeat with no
+trigger. `tests/test_bench_fix_1116.py::DispelSetupOrderTest` pins the polling read-back (a late
+aura proves with ONE send; a lost first 770 -> two `.aura 770` lines; a stub that swallows 770 ->
+row fails) and `::DispelRunOrderTest` drives `Situation.run` with a fake agent: strip before `pull`,
+apply after it, the retry on a refresh without an event, and INVALID when neither apply emits one
+(replaces the old source-text order check). Live proof needs a server run (offline: the old shape is
+the recheck's own marks — `.unaura all` at t 3.98, `.aura 770` at 4.32/4.37, read-back `auras [71]`).
 
 **Low-mana-potion: the 120 s ITEM cooldown survives the per-rep `.cooldown` reset.** The bot drinks
 exactly when the item lets it: the rc1116 wall chain is 120.0-120.1 s after the previous potion
@@ -31,7 +39,15 @@ grace; the recheck gaps read 120.04-120.12 s wall) of the previous rep's LAST po
 carried-over cooldown, never a slow bot — INCONCLUSIVE for that rep with reason
 `item cooldown from rep N-1`. Only the earliest potion of each rep can be carried over, and only
 when it landed AFTER expiry (a first potion stamped inside an old cooldown span keeps the old
-drop-and-score-rest shape, so the bench-1112 `PotionCrossRepCooldownTest` pair still passes). (b)
+drop-and-score-rest shape, so the bench-1112 `PotionCrossRepCooldownTest` pair still passes). Round
+1 of the review (agy HIGH): the carried-over hit is now picked from the scored hits OUTSIDE the
+spans, not from the raw matches — an impossible in-cooldown cast could be `ordered[0]`, skip the
+carryover branch and score the real first potion (just past expiry) as a late miss. `wait_rep_gap`
+orders the rep dirs NUMERICALLY (a string sort put `rep10` before `rep2`, and `rep2`'s older wall
+overwrote its newer potion: the gap then under-waited or skipped) and takes the MAX potion wall
+across the dirs; `test_wait_rep_gap_reads_rep_dirs_numerically_and_keeps_the_newest_potion` pins
+rep2/rep10. The potion trial's `why_expect` now says the gap runs from the previous rep's LAST
+potion, matching `wait_rep_gap` and the README (agy low). (b)
 the runner: new per-trial `situation.min_rep_gap_s` (`trl/scenario.py` validates it as a number of
 seconds > 0, README documents it); the potion trial carries 130, and `run_repeat` waits until 130 s
 have passed since the previous rep's last `Restore Mana` wall time before starting the next rep, so
@@ -54,7 +70,9 @@ Re-scored from a copy of the rc1116 potion run (`20261116-144714-rc1116`, origin
 first potion 150 s after the previous last scores normally; a rep with no potion is still a miss)
 and `::PotionMinRepGapTest` pins the trial field, its validation, and the 130 s wait (no potion yet:
 no wait). The pre-gap JSON and the pre-clause scorer fail the carryover test; the new trial file
-fails `validate` without the `min_rep_gap_s` field. Suite delta to be recorded with the full run.
+fails `validate` without the `min_rep_gap_s` field. Full suite (`python3 -m unittest discover -s tests`):
+910 tests, 11 failures + 5 errors, all 16 pre-existing on origin/main (894 tests, 14 failures + 5 errors;
+the 3 extra there are timing-flaky lease/hire tests that pass alone). New failures on this branch: 0.
 
 ## 2026-11-14: DPS-MAG-COUNTERSPELL scores pooled (a scoring flip, not a regression)
 

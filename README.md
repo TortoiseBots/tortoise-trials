@@ -106,7 +106,10 @@ and `bench_dirty`, so a run always says which bench it used.
 A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `validate`.
 
 - `player`: class, level, talents (tree and spell ids), stance, forced role, auras, items, and `gear`
-  (null or `"tier"`, see below).
+  (null or `"tier"`, see below). `auras` are SETUP auras only (applied after the stance cast, the
+  read-back polls until each lands, a still-missing one is sent once more and re-polled, a missing
+  one then fails `player_auras`). The aura a debuff trial MEASURES is never a setup aura: see
+  `situation.debuff`.
 - `bot` (the hire) and `extra_bots` (more hires, for example a second tank): class, spec, role,
   level, gear tier, items. An `extra_bots` entry may also carry `gear` (a lowercase word such as
   `"blue"`): the runner sends `autogear <name> <gear>` after the role setup and fails
@@ -129,6 +132,13 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
   still be up. A missing hire guid, a refused `.unaura`, a fresh sample with no `auras` list or a
   malformed entry (not "no auras"), or an aura still on the hire makes the repeat INVALID before
   the summon (a prepull rule must never score a form that is still up).
+  `debuff {spell_id: <id>}` is the aura the trial MEASURES (e.g. Faerie Fire 770 for the dispel
+  trial). It is applied to the victim in combat after the pull and proven by a fresh `aura_applied`
+  event past the pre-send event cursor; one more apply when the event never shows, and a repeat
+  whose trigger cannot be proven is INVALID (`no fresh aura_on for <id> after 2 applies`). Just
+  before the pull the runner proves it is ABSENT (a copy left from an earlier repeat is refreshed,
+  not re-applied, by `.aura`: no fresh event to score) and strips it when it is up; an unreadable
+  aura row or an aura still up after `.unaura` makes the repeat INVALID before the pull.
   An `ooc_buffs` window starts with `.unaura all` on the player, and on the hire only when no
   Drink/Food aura is up: a meal aura is waited out (bounded, 30 s) with the hire's auras left
   untouched, and when the meal ends and the trial sets `bot.mana_pct`, that mana is put back
