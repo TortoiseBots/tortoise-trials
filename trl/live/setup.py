@@ -578,6 +578,15 @@ def read_bot_offhand(agent, name):
 
 
 def check_player_auras(agent, trial, guard, ctx, timeout=3.0):
+    """Prove the trial's wanted player auras AFTER the stance lands, retrying once.
+
+    The stance step runs `.unaura all` before casting the stance (check_stance), so any aura
+    applied before it never lands: the dispel trial held stance 71 on every rep while Faerie
+    Fire 770 was missing. This step runs after the stance step in run_setup, sends the wanted
+    auras, then reads back: an aura still missing is sent once more on its own (the runner's
+    retry pattern, like check_talents' missing-spell re-learn) and read again. A missing aura
+    after the retry fails the row, never a silent score.
+    """
     wanted = [int(x) for x in (trial["player"].get("auras") or [])]
     if not wanted:
         return row("player_auras", True, [], "no extra player auras")
@@ -585,6 +594,11 @@ def check_player_auras(agent, trial, guard, ctx, timeout=3.0):
         guard.send("aura", ctx.player_guid, spell)
     have = _aura_ids(agent.own_row())
     missing = [s for s in wanted if s not in have]
+    if missing:
+        for spell in missing:
+            guard.send("aura", ctx.player_guid, spell)
+        have = _aura_ids(agent.own_row())
+        missing = [s for s in wanted if s not in have]
     ok = not missing
     return row("player_auras", ok, sorted(have), "auras %s%s" % (
         sorted(have), "" if ok else "; missing %s" % missing))

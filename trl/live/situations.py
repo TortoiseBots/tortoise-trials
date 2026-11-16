@@ -912,11 +912,6 @@ class Situation:
             self.ctx.checks.append({"id": "cc_mark_set", "ok": False, "value": None,
                                     "evidence": "cc_target wants two humanoid mobs, got 1"})
 
-        if kind == "debuff":
-            debuff = (self.sit.get("debuff") or {}).get("spell_id")
-            if debuff:
-                self.apply_debuff(int(debuff))
-
         wait = float(self.sit.get("pull_after_s") or self.sit.get("ooc_wait_s") or 0)
         if wait:
             time.sleep(wait)
@@ -928,6 +923,14 @@ class Situation:
         if kind == "pack":
             for guid in self.summoned[1:]:
                 self.attack(guid)
+        # the fight target is set and the pull's selection moves are done, and the trial's
+        # setup check runs before this: a 770 applied before the stance step's `.unaura all`
+        # never lands (all 6 recheck reps held 71 with 770 missing). Same `apply_debuff` GM
+        # path, no new command; the refresh loop below keeps it up for the whole repeat.
+        if kind == "debuff":
+            debuff = (self.sit.get("debuff") or {}).get("spell_id")
+            if debuff:
+                self.apply_debuff(int(debuff))
 
         governor = Governor(self.agent, self.guard, self.marks, victim=self.victim,
                             band=self.band, floor=self.floor,
