@@ -1001,6 +1001,17 @@ class Run:
     def run_repeat(self, session, trial, rep_index):
         agent = session.agent
         ledger = getattr(session, "ledger", None) or self.ledger
+        # bench-1116: the Greater Mana Potion's 120 s ITEM cooldown survives the per-rep
+        # `.cooldown` reset, so a rep that starts too soon after the previous rep's last
+        # potion re-scores the carried-over drink as a miss. `min_rep_gap_s` waits between
+        # the previous rep's last potion wall time and this rep's start; the scorer's
+        # INCONCLUSIVE is the backstop for old runs.
+        gap = (trial.get("situation") or {}).get("min_rep_gap_s")
+        if gap is not None and rep_index > 1:
+            try:
+                self.wait_rep_gap(session, trial, float(gap))
+            except (TypeError, ValueError):
+                self.log("%s rep%d: bad min_rep_gap_s %r (no wait)" % (trial.get("id"), rep_index, gap))
         # summons an earlier repeat's cleanup already proved dead or gone are not checked again: a
         # despawned corpse answers "not in view", which used to make the whole check UNKNOWN
         if getattr(session, "verified_summons", None) is None:
@@ -1209,6 +1220,68 @@ class Run:
                "valid": bool(valid), "capped": bool(capped), "ended": str(ended or "")}
         with self._lock:
             self.rep_log.append(row)
+
+    def wait_rep_gap(self, session, trial, gap_s):
+        """Sleep until `gap_s` seconds have passed since the previous rep's last potion.
+
+        One worker runs a trial's reps in order (rep1, rep2, ...), so the finished rep
+        dirs (`rep1` .. `rep{rep_index-1}`) are this trial's own earlier reps; the last
+        `Restore Mana` cast in the newest one with any is the wall clock the item
+        cooldown runs from. No potion anywhere yet (or an unreadable rep dir) means no
+        wait. The wait is bounded (one gap, then the rep starts) and logged.
+        """
+        import glob as _glob
+        import json as _json
+        import time as _time
+        from datetime import datetime as _dt
+        if not gap_s or gap_s <= 0:
+            return 0.0
+        trial_dir = os.path.join(self.run_dir, trial.get("id"))
+        last_wall = None
+        for path in sorted(_glob.glob(os.path.join(trial_dir, "rep*"))):
+            try:
+                marks = [_json.loads(l) for l in open(os.path.join(path, "marks.jsonl"))
+                         if l.strip()]
+            except OSError:
+                continue
+            base = None
+            for m in marks:
+                if m.get("kind") == "fight_start":
+                    try:
+                        base = _dt.fromisoformat(str(m.get("wall"))).timestamp()
+                    except ValueError:
+                        base = None
+                    break
+            if base is None:
+                for m in marks:
+                    if m.get("kind") == "setup_ok":
+                        try:
+                            base = _dt.fromisoformat(str(m.get("wall"))).timestamp()
+                        except ValueError:
+                            base = None
+                        break
+            if base is None:
+                continue
+            try:
+                rows = [_json.loads(l) for l in open(os.path.join(path, "events.jsonl"))
+                        if l.strip()]
+            except OSError:
+                continue
+            for row in rows:
+                if row.get("kind") == "cast" and row.get("spell") == "Restore Mana":
+                    try:
+                        last_wall = base + float(row.get("t") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+        if last_wall is None:
+            return 0.0
+        wait = float(gap_s) - (_time.time() - last_wall)
+        if wait > 0:
+            self.log("%s: waiting %.0f s for the potion item cooldown (min_rep_gap_s %.0f)"
+                     % (trial.get("id"), wait, gap_s))
+            _time.sleep(wait)
+            return wait
+        return 0.0
 
     def apply_player_visible(self, rep_dir, trial, setup_doc):
         """Append the in-fight `player_visible` row to setup.json; a failing one makes the rep INVALID."""

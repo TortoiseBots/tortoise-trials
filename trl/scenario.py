@@ -63,7 +63,7 @@ EXTRA_ITEM_FIELDS = {"name", "count"}
 SIT_FIELDS = {"kind", "mobs", "hp_band", "floor_pct", "victim", "pull_after_s",
               "ooc_wait_s", "debuff", "refill", "roles", "max_rescues_per_min",
               "hurt_every_s", "adaptive", "top_up_to_pct", "damage_interval_s", "reset_hire_cooldowns",
-              "energy_drain", "prepull_unaura"}
+              "energy_drain", "prepull_unaura", "min_rep_gap_s"}
 TALENTS_FIELDS = {"tree", "spells"}
 OPPORTUNITY_FIELDS = {"unit", "hp_lt", "hp_gt", "in_combat", "has_aura"}
 MOBS_FIELDS = {"role", "count", "level_delta", "refill", "refill_every_s"}
@@ -849,6 +849,13 @@ def validate(trial, spells_path=None):
                         or any(isinstance(x, bool) or not isinstance(x, int) or not 1 <= x <= 999999
                                for x in strip)):
                     _err(errs, "%s: prepull_unaura must be a non-empty list of aura/spell ids" % tid)
+            gap = sit.get("min_rep_gap_s")
+            if gap is not None:
+                # bench-1116: the Greater Mana Potion's 120 s item cooldown survives the per-rep
+                # `.cooldown` reset, so the runner waits this long after the previous rep's last
+                # potion before starting the next rep (the scorer drops carried-over reps too).
+                if isinstance(gap, bool) or not isinstance(gap, (int, float)) or gap <= 0:
+                    _err(errs, "%s: min_rep_gap_s must be a number of seconds > 0" % tid)
             if sit.get("kind") == "ooc_hurt":
                 # no mobs: the victim is hurt by a GM line, out of combat, inside hp_band
                 if (isinstance(band, list) and len(band) == 2

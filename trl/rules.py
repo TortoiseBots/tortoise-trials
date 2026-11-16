@@ -1180,6 +1180,40 @@ def evaluate(rule, rows, samples, marks, ctx):
                 if b > a:
                     cool.append((a, b))
         matches = [r for r in rows if _matches(r, where, samples_by_guid, ctx, trial)]
+        if cool and check.get("debounce_responder_across_reps"):
+            # bench-1116: the trial's own text says casts inside an earlier rep's cooldown are
+            # dropped, but the scorer still counted the rep's LATE first potion as a miss. The
+            # bot drinks exactly when the item lets it (the recheck chain lands 120.0-120.1 s
+            # wall after the previous potion, reps 220 s apart for a +20 s drift): a rep whose
+            # FIRST potion lands within one cooldown of the previous rep's LAST potion is the
+            # carried-over cooldown, not a slow bot. Only the earliest potion of each rep can
+            # be the carried-over one, so a first hit past the bound scores normally. The 1 s
+            # grace covers sampler jitter (the recheck gaps read 120.04-120.12 s wall); a rep
+            # opened 143 s after the previous potion (rep6) is clean.
+            try:
+                cooldown = float(check.get("debounce_responder_s") or 0.0)
+            except (TypeError, ValueError):
+                cooldown = 0.0
+            if cooldown > 0:
+                ordered = sorted(matches, key=lambda r: float(r.get("t", 0.0) or 0.0))
+                if ordered:
+                    first_t = float(ordered[0].get("t", 0.0) or 0.0)
+                    # the previous rep's last hit on this rep's base: each span is
+                    # [prev_hit, prev_hit + cooldown], so prev_hit = b - cooldown.
+                    prev_last = max((b - cooldown for (a, b) in cool), default=None)
+                    inside = any(a <= first_t <= b for (a, b) in cool)
+                    if prev_last is not None and not inside and first_t - prev_last <= cooldown + 1.0:
+                        # the whole rep rode the carried-over cooldown: INCONCLUSIVE with
+                        # the brief's reason, never a miss on the second potion. (The old
+                        # inside an earlier cooldown there is impossible or a proc row.)
+                        first = ordered[0]
+                        return {"value": first.get("t", 0.0), "no_match": False, "k": 0, "n": 0,
+                                "verdict": "INCONCLUSIVE",
+                                "evidence": [evidence_line(first)],
+                                "reason": "item cooldown from rep N-1",
+                                "guard": guard_note}
+        # (the carried-over return above fires before this: a clean rep still drops a
+        # cast stamped inside an earlier cooldown as impossible or a proc row).
         if cool:
             # A cast stamped inside an earlier rep's item cooldown is impossible (or a proc row):
             # drop it from the hits, like `scored` drops every excluded span. A rep whose only
