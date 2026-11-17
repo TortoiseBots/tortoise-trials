@@ -2,6 +2,101 @@
 
 Short, dated notes on choices that are not obvious from the code.
 
+## 2026-11-16: bench round 1116: dispel-magic setup order, low-mana-potion carryover gap
+
+Two bench bugs behind the rc1116 recheck, both deterministic setup/scoring artefacts, never the bot.
+
+**Dispel-magic: the 770 debuff never lands.** `check_stance` runs `.unaura all` before casting
+Defensive Stance (71), and the wanted-auras step sent `.aura 770` without proving it afterwards:
+all 6 recheck reps held 71 with 770 missing (`setup INVALID (auras [71]; missing [770])`). Round 1
+of the review found two holes in the first fix: the trial still listed 770 as a setup aura, so it
+was already up at the pull and the post-pull `.aura` only REFRESHED it (no `aura_on` for the rule,
+Codex HIGH), and `check_player_auras` ignored its `timeout` and read back at once, so a late-landing
+aura failed setup (agy HIGH). Final shape, no new GM command: 770 is the trial's TESTED debuff, not
+a setup aura (the trial file's `player.auras` is empty). `check_player_auras` sends the wanted setup
+auras after the stance step, polls until each is up (bounded by `timeout`, like `check_stance`) and
+re-sends only a still-missing one once, polling again. `Situation.strip_debuff` runs just before the
+pull: it proves 770 absent from a fresh victim aura read and `.unaura 770`s a leftover copy, ending
+the repeat INVALID when absence cannot be proven. `Situation.apply_debuff` runs after the pull (in
+combat), takes the event-log cursor before the send, applies `.aura 770` and requires a fresh
+`aura_applied` row for 770 on the victim past that cursor; one more apply when the first event never
+shows, then the repeat is INVALID (`no fresh aura_on ...`) instead of scoring a repeat with no
+trigger. `tests/test_bench_fix_1116.py::DispelSetupOrderTest` pins the polling read-back (a late
+aura proves with ONE send; a lost first 770 -> two `.aura 770` lines; a stub that swallows 770 ->
+row fails) and `::DispelRunOrderTest` drives `Situation.run` with a fake agent: strip before `pull`,
+apply after it, the retry on a refresh without an event, and INVALID when neither apply emits one
+(replaces the old source-text order check). Live proof needs a server run (offline: the old shape is
+the recheck's own marks — `.unaura all` at t 3.98, `.aura 770` at 4.32/4.37, read-back `auras [71]`).
+
+**Low-mana-potion: the 120 s ITEM cooldown survives the per-rep `.cooldown` reset.** The bot drinks
+exactly when the item lets it: the rc1116 wall chain is 120.0-120.1 s after the previous potion
+(reps 220 s apart, +20 s drift per rep: first potions -0.29, 19.9, 38.5, 59.1, 76.8, -0.32). The
+trial's own text already said in-cooldown casts are dropped, but the scorer still counted each
+carried-over late first potion as a miss (FAIL 32.3 s median, 6/6 valid). Fix in both halves, as the
+brief requires: (a) the scorer (`trl/rules.py`, `first` metric with
+`debounce_responder_across_reps`): a rep whose FIRST potion lands within one cooldown (+1 s sampler
+grace; the recheck gaps read 120.04-120.12 s wall) of the previous rep's LAST potion is the
+carried-over cooldown, never a slow bot — INCONCLUSIVE for that rep with reason
+`item cooldown from rep N-1`. Only the earliest potion of each rep can be carried over, and only
+when it landed AFTER expiry (a first potion stamped inside an old cooldown span keeps the old
+drop-and-score-rest shape, so the bench-1112 `PotionCrossRepCooldownTest` pair still passes). Round
+1 of the review (agy HIGH): the carried-over hit is now picked from the scored hits OUTSIDE the
+spans, not from the raw matches — an impossible in-cooldown cast could be `ordered[0]`, skip the
+carryover branch and score the real first potion (just past expiry) as a late miss. `wait_rep_gap`
+orders the rep dirs NUMERICALLY (a string sort put `rep10` before `rep2`, and `rep2`'s older wall
+overwrote its newer potion: the gap then under-waited or skipped) and takes the MAX potion wall
+across the dirs; `test_wait_rep_gap_reads_rep_dirs_numerically_and_keeps_the_newest_potion` pins
+rep2/rep10. The potion trial's `why_expect` now says the gap runs from the previous rep's LAST
+potion, matching `wait_rep_gap` and the README (agy low). (b)
+the runner: new per-trial `situation.min_rep_gap_s` (`trl/scenario.py` validates it as a number of
+seconds > 0, README documents it); the potion trial carries 130, and `run_repeat` waits until 130 s
+have passed since the previous rep's last `Restore Mana` wall time before starting the next rep, so
+new runs open with the potion off cooldown (the scorer clause is the backstop for old runs).
+
+Re-scored from a copy of the rc1116 potion run (`20261116-144714-rc1116`, originals untouched):
+
+| rep | before | after |
+|---|---|---|
+| rep1 | PASS -0.29 | PASS -0.29 |
+| rep2 | PASS 19.89 | INCONCLUSIVE 19.89, `item cooldown from rep N-1` |
+| rep3 | FAIL 38.51 | INCONCLUSIVE 38.51, `item cooldown from rep N-1` |
+| rep4 | FAIL 59.08 | INCONCLUSIVE 59.08, `item cooldown from rep N-1` |
+| rep5 | FAIL 76.78 | INCONCLUSIVE 76.78, `item cooldown from rep N-1` |
+| rep6 | PASS -0.32 | PASS -0.32 |
+| trial | FAIL median 32.3 s, 6/6 valid | PASS, 2/2 valid (reps 1, 6 clean) |
+
+`tests/test_bench_fix_1116.py::PotionCarryoverTest` re-scores a fixture shaped like the run's events
+(old code: rep2 PASS, new code: reps 2-5 INCONCLUSIVE with the brief's reason, reps 1/6 scored; a
+first potion 150 s after the previous last scores normally; a rep with no potion is still a miss)
+and `::PotionMinRepGapTest` pins the trial field, its validation, and the 130 s wait (no potion yet:
+no wait). The pre-gap JSON and the pre-clause scorer fail the carryover test; the new trial file
+fails `validate` without the `min_rep_gap_s` field. Full suite (`python3 -m unittest discover -s tests`):
+910 tests, 11 failures + 5 errors, all 16 pre-existing on origin/main (894 tests, 14 failures + 5 errors;
+the 3 extra there are timing-flaky lease/hire tests that pass alone). New failures on this branch: 0.
+
+**Round 2 of the review: the dispel trial's first trigger, rep order, and a truncated JSONL.** Three
+mediums, all fixed here and covered by fail-first tests. (1) `Situation.run` applied the tested debuff
+before the fight loop stamped `fight_start`, so the first `aura_on` (the apply's own, the one
+`apply_debuff` proves) was stamped at t < 0 and `window_rows` dropped it from the (0, fight_end)
+latency window: the trial's opening trigger was never scored. The pull is the trial's latency zero;
+`Situation.start_fight()` stamps it once, and a debuff situation calls it BEFORE the apply (the loop
+still stamps every other kind on the first in-combat tick). The loop now tracks `fight_seen` instead
+of `fight_start` for the 60 s `no_fight` end, so a debuff rep whose pull never put a mob in combat
+still ends `no_fight` rather than scoring debuff refreshes with no answers.
+`test_the_first_aura_on_lands_inside_the_scored_window` drives a real `collect.Marks` and a fake
+server whose `.aura` event lands a poll later (the live shape) and asserts the event's wall is at or
+after the fight_start wall and `window_rows` keeps it; on the old order it lands 0.2 s before the
+stamp and the window drops it. (2) `score_trial` sorted `rep*` dirs as strings, so `rep10` was
+scored between `rep1` and `rep2` and the cross-rep cooldowns threaded through the wrong neighbours;
+`trl/score.py` now owns `rep_number`/`rep_dirs` and `wait_rep_gap` imports the same order.
+`RepOrderTest` pins rep1..rep10. (3) `wait_rep_gap` decoded every prior JSONL line and caught only
+`OSError`, so a half-written last record raised `JSONDecodeError` past the caller's
+`TypeError`/`ValueError` guard and aborted the run. Lines are parsed tolerantly now: a malformed
+line is skipped and logged, and a rep whose potion state cannot be established (malformed
+`events.jsonl` record, a missing `events.jsonl`/base wall) gets the conservative full
+`min_rep_gap_s` wait instead of 0; a malformed `marks.jsonl` tail is harmless because the base is
+at the head. Three tests pin the crash, the conservative wait and the intact-evidence remainder.
+
 ## 2026-11-14: DPS-MAG-COUNTERSPELL scores pooled (a scoring flip, not a regression)
 
 `DPS-MAG-COUNTERSPELL` (`dps-mage-counterspell-caster`) now carries `pool: true` with

@@ -33,6 +33,7 @@ DROP_WINDOW_S = 20.0        # only falls this recent drive an early rescue
 HURT_EVERY_S = 20.0
 STANCE_RECAST_GAP_S = 5.0
 PREPULL_AURA_WAIT_S = 3.0  # the hire's aura row drops a tick or two after `.unaura`; then it must be gone
+DEBUFF_AURA_WAIT_S = 3.0   # the fresh `aura_applied` of the trial's tested debuff must show in this window
 # ooc window start (bench-1113): a low-mana hire can be mid-meal when the window opens. `.unaura all`
 # over an active Drink/Food cuts the meal, and a cut meal can leave the AI asleep in it (priest-holy-
 # low-mana-drinks AFTER t1113: 33-35 s of nothing after a stripped setup drink). The window never
@@ -912,14 +913,22 @@ class Situation:
             self.ctx.checks.append({"id": "cc_mark_set", "ok": False, "value": None,
                                     "evidence": "cc_target wants two humanoid mobs, got 1"})
 
-        if kind == "debuff":
-            debuff = (self.sit.get("debuff") or {}).get("spell_id")
-            if debuff:
-                self.apply_debuff(int(debuff))
-
         wait = float(self.sit.get("pull_after_s") or self.sit.get("ooc_wait_s") or 0)
         if wait:
             time.sleep(wait)
+
+        # the tested debuff is not a setup aura: a copy left over from an earlier repeat (or
+        # applied in setup before the stance step's `.unaura all`, rc1116: all 6 reps held 71
+        # with 770 missing) is already up at the pull, and a second `.aura` only refreshes it
+        # instead of emitting the `aura_on` the rule measures. Strip it and prove it gone
+        # before the pull; the apply below the pull then always creates the trigger.
+        debuff = 0
+        if kind == "debuff":
+            debuff = int((self.sit.get("debuff") or {}).get("spell_id") or 0)
+            if debuff:
+                why = self.strip_debuff(debuff)
+                if why:
+                    return {"ok": False, "ended": "prepull", "invalid_reason": why}
 
         if kind == "cc_target" and self.summoned:
             self.engage_cc_targets()
@@ -928,6 +937,18 @@ class Situation:
         if kind == "pack":
             for guid in self.summoned[1:]:
                 self.attack(guid)
+        # the debuff lands in combat, after the pull, and a fresh `aura_applied` event proves
+        # the trigger; one more apply when the first event never shows. A repeat whose trigger
+        # cannot be proven is INVALID, never scored as a no-match. The refresh loop below keeps
+        # it up for the whole repeat (same GM path, no new command).
+        # The debuff is the trial's own latency zero, so the fight is stamped BEFORE the apply:
+        # an `aura_on` that lands a moment after the pull is the rule's trigger at t >= 0, not
+        # a pre-fight row the (0, fight_end) latency window drops.
+        if debuff:
+            self.start_fight()
+        if debuff and not self.apply_debuff(debuff):
+            return {"ok": False, "ended": "debuff",
+                    "invalid_reason": "no fresh aura_on for %d after 2 applies" % debuff}
 
         governor = Governor(self.agent, self.guard, self.marks, victim=self.victim,
                             band=self.band, floor=self.floor,
@@ -957,6 +978,7 @@ class Situation:
         ended = ""
         invalid = ""
         gap_start = None          # cc_target: since when no unmarked summon has been alive
+        fight_seen = False        # a summon was seen in combat (the pull worked)
         try:
             entered = time.time()
             while True:
@@ -966,11 +988,15 @@ class Situation:
                     invalid = reason
                     break
                 now = time.time()
-                if not self.fight_start and self.fighting(self.summoned):
-                    self.fight_start = now
-                    self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned]})
-                    deadline = now + duration
-                if not self.fight_start and now - entered > 60.0:
+                if not fight_seen and self.fighting(self.summoned):
+                    fight_seen = True
+                if not self.fight_start and fight_seen:
+                    self.start_fight(now)
+                if self.fight_start and deadline is None:
+                    deadline = self.fight_start + duration
+                if not fight_seen and now - entered > 60.0:
+                    # a debuff rep stamps fight_start before its apply; a pull that never put a
+                    # mob in combat is still no_fight, never a scored rep with no triggers
                     ended = "no_fight"
                     break
                 if governor.ended:
@@ -1412,6 +1438,20 @@ class Situation:
             return {"ok": False, "ended": "disconnected", "invalid_reason": invalid}
         return {"ok": True, "ended": ended}
 
+    def start_fight(self, now=None):
+        """Stamp the repeat's scored base once: t = 0 for every rule in the rep.
+
+        The pull's first attack starts the fight, so the stamp belongs right after the pull.
+        A situation that applies its own trigger (the tested debuff) must stamp BEFORE that
+        apply: `window_rows` keeps latency rules at (0, fight_end), and an `aura_on` from the
+        apply is dropped as a pre-fight row when fight_start is stamped only on the next tick.
+        """
+        if self.fight_start:
+            return self.fight_start
+        self.fight_start = float(now if now is not None else time.time())
+        self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned]})
+        return self.fight_start
+
     def fighting(self, mobs):
         ids = {norm_guid(g) for g in mobs}
         for unit in self.agent.units(within=40):
@@ -1456,12 +1496,123 @@ class Situation:
                 "value": echo or line,
                 "evidence": "mark %s; .bot %s -> %s%s" % (echo, intent, line or "no TBM:ACTION_ACK", err)}
 
-    def apply_debuff(self, spell_id):
-        target = self.victim_target_guid()
+    def victim_aura_ids(self):
+        """The victim's aura ids from a fresh unit read (None when the agent cannot answer).
+
+        A missing, null or partly malformed `auras` list is not an empty list: the strip reads
+        an empty set as "every aura absent", so only a list in which every entry parses counts.
+        """
+        guid = self.victim_target_guid()
+        if not guid:
+            return None
         try:
-            self.guard.send("aura", target, int(spell_id))
-        except Exception as exc:  # noqa: BLE001
-            self.log("debuff refused: %s" % exc)
+            unit = self.agent.unit(guid=guid)
+        except Exception:  # noqa: BLE001 - an unreadable unit is unknown, not absent
+            return None
+        if not isinstance(unit, dict):
+            return None
+        auras = unit.get("auras")
+        if not isinstance(auras, list):
+            return None
+        out = set()
+        for entry in auras:
+            try:
+                out.add(int(entry.get("spell_id") if isinstance(entry, dict) else entry))
+            except (TypeError, ValueError, AttributeError):
+                return None
+        return out
+
+    def strip_debuff(self, spell_id):
+        """Prove the tested debuff absent just before the pull; strip a copy that is up.
+
+        The debuff is what the trial MEASURES, not a setup aura (the trial file no longer lists
+        it under `player.auras`): a copy left from an earlier repeat is already up when the
+        post-pull `.aura` runs, and the server refreshes it rather than emitting the `aura_on`
+        event the rule scores. Returns the reason when absence cannot be proven: the caller ends
+        the repeat INVALID before the pull, never scoring a refresh or a stale trigger.
+        """
+        spell = int(spell_id)
+        have = self.victim_aura_ids()
+        if have is None:
+            why = "debuff %d: no fresh aura read of the %s" % (spell, self.victim)
+            self.marks.add({"kind": "debuff_strip_failed", "reason": why})
+            return why
+        if spell not in have:
+            self.marks.add({"kind": "debuff_absent", "spell": spell})
+            return ""
+        try:
+            self.guard.send("unaura", self.victim_target_guid(), spell)
+        except Exception as exc:  # noqa: BLE001 - a refused line makes the repeat INVALID
+            why = "debuff %d unaura refused: %s" % (spell, str(exc)[:120])
+            self.log(why)
+            self.marks.add({"kind": "debuff_strip_failed", "reason": why})
+            return why
+
+        def gone():
+            ids = self.victim_aura_ids()
+            return ids is not None and spell not in ids
+
+        if not wait_until(gone, timeout=PREPULL_AURA_WAIT_S, poll=0.3):
+            ids = self.victim_aura_ids()
+            if ids is None:
+                why = "debuff %d: no fresh aura read after the unaura" % spell
+            else:
+                why = "debuff %d still up after .unaura" % spell
+            self.log(why)
+            self.marks.add({"kind": "debuff_strip_failed", "reason": why})
+            return why
+        self.marks.add({"kind": "debuff_stripped", "spell": spell})
+        return ""
+
+    def apply_debuff(self, spell_id):
+        """Apply the tested debuff in combat and prove a fresh `aura_applied` event (retry once).
+
+        A refresh of an aura already up emits no event, so the event past the pre-send cursor is
+        the proof the rule has its trigger (`strip_debuff` ran before the pull). One more apply
+        when the first event never shows; False when neither produced it.
+        """
+        target = self.victim_target_guid()
+        spell = int(spell_id)
+        for attempt in (1, 2):
+            since = self.agent.snapshot()
+            try:
+                self.guard.send("aura", target, spell)
+            except Exception as exc:  # noqa: BLE001 - a refused line is retried once, then fails
+                self.log("debuff refused: %s" % exc)
+            if wait_until(lambda: self._fresh_aura_on(since, spell, target),
+                          timeout=DEBUFF_AURA_WAIT_S, poll=0.2):
+                self.marks.add({"kind": "debuff_applied", "spell": spell, "attempt": attempt,
+                                "fresh": True})
+                return True
+            self.marks.add({"kind": "debuff_apply", "spell": spell, "attempt": attempt,
+                            "fresh": False})
+        return False
+
+    def _fresh_aura_on(self, since, spell_id, target):
+        """A new `aura_applied` row for `spell_id` on `target` past cursor `since`.
+
+        A row without an attributable target still counts: `strip_debuff` proved the spell
+        absent on the victim just before the pull, so a fresh event for it in this window is
+        the apply's own. A row that names another target does not count.
+        """
+        page = self.agent.events_since(since=since, limit=200, wait_ms=0)
+        want = norm_guid(target)
+        for row in page.get("events") or []:
+            if row.get("kind") != "aura_applied":
+                continue
+            try:
+                if int(row.get("spell_id") or 0) != int(spell_id):
+                    continue
+                seq = row.get("seq")
+                if seq is not None and since is not None and int(seq) <= int(since):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            got = event_guid(row, "target")
+            if want and got and got != want:
+                continue
+            return True
+        return False
 
 def mobs_ready_row(agent, ledger, window, guids, engaged=None, marked=None):
     """`engaged`: guids that must also be in combat (cc_target: every unmarked summon)."""

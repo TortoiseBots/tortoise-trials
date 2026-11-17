@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 from .. import gear as gear_mod
 from .. import scenario
+from ..score import rep_dirs
 from . import collect, ladder, lease, pacing, situations, teardown
 from .agent import Agent, RpcError, norm_guid
 from .gm_guard import GmAborted, GmContext, GmGuard, GmRefused, GmServerError
@@ -1001,6 +1002,17 @@ class Run:
     def run_repeat(self, session, trial, rep_index):
         agent = session.agent
         ledger = getattr(session, "ledger", None) or self.ledger
+        # bench-1116: the Greater Mana Potion's 120 s ITEM cooldown survives the per-rep
+        # `.cooldown` reset, so a rep that starts too soon after the previous rep's last
+        # potion re-scores the carried-over drink as a miss. `min_rep_gap_s` waits between
+        # the previous rep's last potion wall time and this rep's start; the scorer's
+        # INCONCLUSIVE is the backstop for old runs.
+        gap = (trial.get("situation") or {}).get("min_rep_gap_s")
+        if gap is not None and rep_index > 1:
+            try:
+                self.wait_rep_gap(session, trial, float(gap))
+            except (TypeError, ValueError):
+                self.log("%s rep%d: bad min_rep_gap_s %r (no wait)" % (trial.get("id"), rep_index, gap))
         # summons an earlier repeat's cleanup already proved dead or gone are not checked again: a
         # despawned corpse answers "not in view", which used to make the whole check UNKNOWN
         if getattr(session, "verified_summons", None) is None:
@@ -1166,13 +1178,15 @@ class Run:
         setup_doc["mob_source"] = situation.mob_source
         setup_doc["outcome"] = outcome
         failed = [c for c in setup_doc["checks"] if not c.get("ok") and c.get("id") != "config_read"]
-        # no arena / no mobs / prepull / meal = no fight happened: the failed mobs_ready and
-        # player_visible rows are only its consequence, so the rep says WHY there was no fight
-        # (sweep-1b read "player not visible" and "0/0 summons" for 7 reps whose real cause was a
-        # polluted arena; a refused prepull unaura must keep its own reason, not "player not
-        # visible"; a meal still up after MEAL_WAIT_S leaves no window at all, so the reason is
-        # "meal still active")
-        no_fight = str(outcome.get("ended") or "") in ("no arena", "no mobs", "prepull", "meal")
+        # no arena / no mobs / prepull / meal / debuff = no scored fight happened: the failed
+        # mobs_ready and player_visible rows are only its consequence, so the rep says WHY there
+        # was no fight (sweep-1b read "player not visible" and "0/0 summons" for 7 reps whose real
+        # cause was a polluted arena; a refused prepull unaura must keep its own reason, not
+        # "player not visible"; a meal still up after MEAL_WAIT_S leaves no window at all, so the
+        # reason is "meal still active"; a debuff whose fresh `aura_on` never showed keeps
+        # "no fresh aura_on ...", not "player not visible")
+        no_fight = str(outcome.get("ended") or "") in ("no arena", "no mobs", "prepull", "meal",
+                                                      "debuff")
         setup_doc["ok"] = not failed and not outcome.get("invalid_reason")
         if no_fight and outcome.get("invalid_reason"):
             setup_doc["invalid_reason"] = outcome["invalid_reason"]
@@ -1209,6 +1223,115 @@ class Run:
                "valid": bool(valid), "capped": bool(capped), "ended": str(ended or "")}
         with self._lock:
             self.rep_log.append(row)
+
+    def wait_rep_gap(self, session, trial, gap_s):
+        """Sleep until `gap_s` seconds have passed since the previous rep's last potion.
+
+        One worker runs a trial's reps in order (rep1, rep2, ...), so the finished rep
+        dirs (`rep1` .. `rep{rep_index-1}`) are this trial's own earlier reps; the last
+        `Restore Mana` cast in the newest one with any is the wall clock the item
+        cooldown runs from. The dirs are ordered NUMERICALLY (rep2 before rep10: a string
+        sort put rep10 first and rep2's older wall overwrote its newer potion) and the
+        newest potion across all of them wins. No potion anywhere yet means no wait.
+
+        A rep dir whose telemetry is unreadable (a partial collector write leaves a
+        truncated JSONL line, or marks/events are missing) has an UNKNOWN cooldown state:
+        its potion may be the newest one, so the wait is the conservative full `gap_s`
+        instead of no wait. A malformed line is skipped and logged, never raised (the
+        caller only catches TypeError/ValueError, so a JSONDecodeError here aborted the
+        whole run). The wait is bounded (one gap, then the rep starts) and logged.
+        """
+        import json as _json
+        import time as _time
+        from datetime import datetime as _dt
+        if not gap_s or gap_s <= 0:
+            return 0.0
+        trial_dir = os.path.join(self.run_dir, trial.get("id"))
+
+        def rows_of(filename):
+            """(rows, bad): one JSONL file's rows and its malformed-line count; None if unreadable.
+
+            An interrupted collector or a killed run leaves a partial last line; that line is
+            skipped (never raised, which used to abort the run) and counted so the caller can
+            treat the rep's cooldown state as unknown.
+            """
+            try:
+                with open(os.path.join(path, filename)) as f:
+                    lines = f.readlines()
+            except OSError:
+                return None
+            rows, bad = [], 0
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    row = _json.loads(line)
+                except ValueError:
+                    bad += 1
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+            return rows, bad
+
+        def wall_secs(row):
+            try:
+                return _dt.fromisoformat(str(row.get("wall"))).timestamp()
+            except (TypeError, ValueError):
+                return None
+
+        last_wall = None
+        unknown = ""
+        for path in rep_dirs(trial_dir):
+            got = rows_of("marks.jsonl")
+            if got is None:
+                unknown = "marks.jsonl unreadable"
+                break
+            marks, _bad = got      # a malformed tail cannot hide the fight_start at its head
+            base = None
+            for m in marks:
+                if m.get("kind") == "fight_start":
+                    base = wall_secs(m)
+                    break
+            if base is None:
+                for m in marks:
+                    if m.get("kind") == "setup_ok":
+                        base = wall_secs(m)
+                        break
+            if base is None:
+                unknown = "no fight_start/setup_ok wall"
+                break
+            got = rows_of("events.jsonl")
+            if got is None:
+                unknown = "events.jsonl unreadable"
+                break
+            events, bad = got       # a truncated cast could be the newest potion: unknown
+            if bad:
+                unknown = "%d malformed events.jsonl line(s)" % bad
+                break
+            for row in events:
+                if row.get("kind") == "cast" and row.get("spell") == "Restore Mana":
+                    try:
+                        cast_wall = base + float(row.get("t") or 0.0)
+                    except (TypeError, ValueError):
+                        unknown = "cast row without a usable t"
+                        break
+                    last_wall = cast_wall if last_wall is None else max(last_wall, cast_wall)
+            if unknown:
+                break
+        if unknown:
+            self.log("%s: unknown potion cooldown (%s); waiting the full min_rep_gap_s %.0f s"
+                     % (trial.get("id"), unknown, gap_s))
+            _time.sleep(float(gap_s))
+            return float(gap_s)
+        if last_wall is None:
+            return 0.0
+        wait = float(gap_s) - (_time.time() - last_wall)
+        if wait > 0:
+            self.log("%s: waiting %.0f s for the potion item cooldown (min_rep_gap_s %.0f)"
+                     % (trial.get("id"), wait, gap_s))
+            _time.sleep(wait)
+            return wait
+        return 0.0
 
     def apply_player_visible(self, rep_dir, trial, setup_doc):
         """Append the in-fight `player_visible` row to setup.json; a failing one makes the rep INVALID."""

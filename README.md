@@ -106,7 +106,10 @@ and `bench_dirty`, so a run always says which bench it used.
 A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `validate`.
 
 - `player`: class, level, talents (tree and spell ids), stance, forced role, auras, items, and `gear`
-  (null or `"tier"`, see below).
+  (null or `"tier"`, see below). `auras` are SETUP auras only (applied after the stance cast, the
+  read-back polls until each lands, a still-missing one is sent once more and re-polled, a missing
+  one then fails `player_auras`). The aura a debuff trial MEASURES is never a setup aura: see
+  `situation.debuff`.
 - `bot` (the hire) and `extra_bots` (more hires, for example a second tank): class, spec, role,
   level, gear tier, items. An `extra_bots` entry may also carry `gear` (a lowercase word such as
   `"blue"`): the runner sends `autogear <name> <gear>` after the role setup and fails
@@ -116,13 +119,31 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
   `top_up_to_pct` (a number inside the band, not for ooc kinds) drops the governor's top-up to that
   percent instead of the band middle. `reset_hire_cooldowns: true` clears the hire's cooldowns before
   the first summon (check `hire_cooldowns_reset`; it does NOT clear an item cooldown such as Thistle
-  Tea's). `energy_drain {first_at_s 5-170, every_s >= 20, to 0-19}` (rogue `tank_damage` only)
+  Tea's). `min_rep_gap_s` (a number of seconds > 0) waits between the previous repeat's last
+  `Restore Mana` potion wall time and the next repeat's start, so a rep never opens inside the
+  120 s Greater Mana Potion item cooldown the per-rep `.cooldown` cannot reset (the potion trial
+  carries 130). An earlier rep dir whose telemetry is unusable (a partial last JSONL line, a
+  missing `marks.jsonl`/`events.jsonl`) has an unknown potion state and gets the conservative
+  full `min_rep_gap_s` wait; a malformed line is skipped and logged, never raised. A rep whose
+  first potion still lands within one cooldown (+1 s sampler grace)
+  of the previous rep's last potion scores INCONCLUSIVE with reason `item cooldown from rep N-1`,
+  never a late-cast miss; only the earliest potion of each rep can be the carried-over one.
+  `energy_drain {first_at_s 5-170, every_s >= 20, to 0-19}` (rogue `tank_damage` only)
   empties the hire's bar on schedule with `energy_drain` marks, stamped at the `.modify energy` send.
   `prepull_unaura: [<aura id>, ...]` strips those auras off the hire before the pull: the hire is
   reused between repeats, so a form an earlier repeat cast (e.g. Shadowform 15473) would otherwise
   still be up. A missing hire guid, a refused `.unaura`, a fresh sample with no `auras` list or a
   malformed entry (not "no auras"), or an aura still on the hire makes the repeat INVALID before
   the summon (a prepull rule must never score a form that is still up).
+  `debuff {spell_id: <id>}` is the aura the trial MEASURES (e.g. Faerie Fire 770 for the dispel
+  trial). It is applied to the victim in combat after the pull and proven by a fresh `aura_applied`
+  event past the pre-send event cursor; one more apply when the event never shows, and a repeat
+  whose trigger cannot be proven is INVALID (`no fresh aura_on for <id> after 2 applies`). The
+  pull stamps the repeat's `fight_start` (t = 0) BEFORE that apply, so the first `aura_on` lands
+  inside the rule's latency window instead of before it. Just
+  before the pull the runner proves it is ABSENT (a copy left from an earlier repeat is refreshed,
+  not re-applied, by `.aura`: no fresh event to score) and strips it when it is up; an unreadable
+  aura row or an aura still up after `.unaura` makes the repeat INVALID before the pull.
   An `ooc_buffs` window starts with `.unaura all` on the player, and on the hire only when no
   Drink/Food aura is up: a meal aura is waited out (bounded, 30 s) with the hire's auras left
   untouched, and when the meal ends and the trial sets `bot.mana_pct`, that mana is put back

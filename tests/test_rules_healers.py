@@ -522,8 +522,13 @@ class DispelTest(RepMixin, unittest.TestCase):
 
     def test_dispel_trial_proves_the_debuff_lands(self):
         trial = load("priest-holy-dispel-magic")
-        self.assertIn("player_auras", trial["setup_checks"])
-        self.assertEqual(trial["player"]["auras"], [FF])
+        self.assertIn("player_stance", trial["setup_checks"])
+        # the debuff is the TESTED aura, not a setup aura: a 770 applied in setup (or left
+        # from an earlier rep) is already up at the pull, and the post-pull `.aura` only
+        # refreshes it, so the rule has no fresh `aura_on` to score. The runner strips it
+        # and proves it absent before the pull, then applies it and proves the event.
+        self.assertEqual(trial["player"]["auras"], [])
+        self.assertNotIn("player_auras", trial["setup_checks"])
         self.assertEqual(trial["situation"]["debuff"], {"spell_id": FF})
         self.assertEqual(json.load(open(os.path.join(ROOT, "data", "spells.json")))["by_id"][str(FF)]["dispel"], 1)
 

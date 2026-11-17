@@ -577,14 +577,35 @@ def read_bot_offhand(agent, name):
             "evidence": "off-hand slot is empty"}
 
 
-def check_player_auras(agent, trial, guard, ctx, timeout=3.0):
+def check_player_auras(agent, trial, guard, ctx, timeout=3.0, poll=0.2):
+    """Prove the trial's wanted player auras AFTER the stance lands, retrying once.
+
+    The stance step runs `.unaura all` before casting the stance (check_stance), so any aura
+    applied before it never lands: the dispel trial held stance 71 on every rep while Faerie
+    Fire 770 was missing. This step runs after the stance step in run_setup, sends the wanted
+    auras, then reads back: the read polls until every wanted aura is up (bounded by `timeout`,
+    like check_stance) because the server applies an aura a tick after `.aura` and one immediate
+    read proves nothing. An aura still missing after that window is sent once more on its own
+    (the runner's retry pattern, like check_talents' missing-spell re-learn) and polled again.
+    A missing aura after the retry fails the row, never a silent score.
+    """
     wanted = [int(x) for x in (trial["player"].get("auras") or [])]
     if not wanted:
         return row("player_auras", True, [], "no extra player auras")
-    for spell in wanted:
-        guard.send("aura", ctx.player_guid, spell)
-    have = _aura_ids(agent.own_row())
-    missing = [s for s in wanted if s not in have]
+
+    def landed():
+        have = _aura_ids(agent.own_row())
+        return have if all(s in have for s in wanted) else None
+
+    missing = list(wanted)
+    for attempt in (1, 2):
+        for spell in (wanted if attempt == 1 else missing):
+            guard.send("aura", ctx.player_guid, spell)
+        have = wait_until(landed, timeout=timeout, poll=poll)
+        have = _aura_ids(agent.own_row()) if have is None else have
+        missing = [s for s in wanted if s not in have]
+        if not missing:
+            break
     ok = not missing
     return row("player_auras", ok, sorted(have), "auras %s%s" % (
         sorted(have), "" if ok else "; missing %s" % missing))

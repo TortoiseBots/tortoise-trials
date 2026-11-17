@@ -12,6 +12,7 @@ card.md and card.json in the run dir.
 import glob
 import json
 import os
+import re
 import sys
 
 try:
@@ -385,8 +386,24 @@ def _prior_events(rep_dir):
     return out
 
 
+def rep_number(path):
+    """The numeric index of a `repN` dir: rep10 sorts after rep9, never after rep1.
+
+    The runner's `wait_rep_gap` and this scorer must agree on the order (score_trial threads
+    each scored rep's events into the next rep's cross-rep cooldowns), and a string sort puts
+    `rep10` right after `rep1`.
+    """
+    m = re.search(r"rep(\d+)$", os.path.basename(os.path.normpath(path)))
+    return int(m.group(1)) if m else -1
+
+
+def rep_dirs(trial_dir):
+    """A trial's `rep*` dirs in run order."""
+    return sorted(glob.glob(os.path.join(trial_dir, "rep*")), key=rep_number)
+
+
 def score_trial(trial_dir, trial):
-    reps = sorted(glob.glob(os.path.join(trial_dir, "rep*")))
+    reps = rep_dirs(trial_dir)
     carries = any(((r.get("check") or {}).get("debounce_responder_across_reps")
                    for r in trial.get("rules") or []))
     prior = []
