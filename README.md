@@ -11,7 +11,7 @@ happens, scores it, and compares a run before a fix with a run after it.
 ## Requirements
 
 - Python 3.11 or newer, standard library only.
-- A turtle-agent binary (https://github.com/pjerra/turtle-agent), built with the `lease` and
+- A turtle-agent binary (https://github.com/TortoiseBots/turtle-agent), built with the `lease` and
   `slot setup` commands, on `PATH` as `turtle-agent`, or given with `--binary` or `TRIALS_BINARY`.
 - A TortoiseBots test server with the Eluna test toolkit (the runner sends GM and `.bot` commands,
   summons mobs, and reads positions and health through the toolkit).
