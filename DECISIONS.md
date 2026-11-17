@@ -22,13 +22,26 @@ Decision: no INVALID for early combat; combat start is the truthful t0. No trial
 selection with target=0 and `attack()` never faced, so the mob sat on the priest while the
 player's Taunt failed `unit_not_infront` (28/29 in one rep) and the priest's own Fade/fear/ragged
 casts ate the 12 misses. Both now `face` the mob first under `action_lock` (RpcError: log and
-continue): `threat()` picks the first guid of `alive_now()` (fallback `summoned[-1]`, none means
-return; a dead first summon is skipped), `attack(guid)` faces before `rpc("attack")`. The Fade
-order (owner-approved) stays: with the mob held, it should stop firing.
+continue): `threat()` picks the first guid of the live unmarked summons (fallback the last
+unmarked summon, none means return; a dead first summon is skipped), `attack(guid)` faces before
+`rpc("attack")` and refuses the trial's CC-marked mob outright (round 1: `attack()` on the sheep
+would break the cc trial). The Fade order (owner-approved) stays: with the mob held, it should
+stop firing.
 
-`tests/test_bench_fix_1117.py` pins all of it (8 tests; see the docstring). Full suite (`python3 -m
-unittest discover -s tests` under `nice` + `flock /tmp/trials-test.lock`): 918 tests, 11 failures
-+ 5 errors — the same 16 names as main 5fcf700, new failures 0.
+`tests/test_bench_fix_1117.py` pins all of it (12 tests; see the docstring). Round 1 of the
+review (codex + agy adversarial) found four holes, all fixed here: (HIGH) a transient unit-list
+failure inside `pull_wait()` aborted the whole repeat — a failed poll is now retried until the
+wait deadline (the loop's own alive reads skip the tick the same way). (HIGH) `threat()`
+targeted and Taunted the marked CC mob once `summoned[0]` died: both `threat()` and `attack()`
+now exclude `ctx.guids["marked"]` (`unmarked_guids()`; `cc_targets()` reuses it). (MEDIUM x2)
+the early stamp left `fight_seen` False so the rep could later score "no fight": `pull_wait()` now
+sets `fight_seen` (default False in `__init__`, carried into the loop), and the source-inspection
+wiring pin is a behaviour test that runs `Situation.run()` with combat during the wait and the
+mob gone by the first loop tick. The `early_s` clamp (`max(0.0, ...)`, agy low) keeps a late
+`fighting()` RPC from printing a negative `early_fight`.
+
+Full suite (`python3 -m unittest discover -s tests` under `nice` + `flock
+/tmp/trials-test.lock`): counts in the round report — new failures 0 vs main's known 16.
 
 ## 2026-11-16: bench round 1116: dispel-magic setup order, low-mana-potion carryover gap
 

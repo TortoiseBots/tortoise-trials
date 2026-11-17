@@ -529,6 +529,7 @@ class Situation:
         self.mob_source = "summon"
         self.last_summon_wall = ""      # the `.npc summon` send wall of the last claimed summon
         self.fight_start = None
+        self.fight_seen = False     # set by pull_wait() when combat starts during the wait
         self.ended = ""
         self.drain_next = None
 
@@ -733,8 +734,14 @@ class Situation:
 
     def attack(self, guid):
         # face first: the GM "tank" never faced the mob, so the mob sat on the
-        # priest while every Taunt failed unit_not_infront (bench-1117). The same
-        # lock the guard takes around select+send: the selection is shared.
+        # priest while every Taunt failed unit_not_infront (bench-1117). Never the
+        # trial's crowd-controlled mark: breaking the sheep fails the cc trial,
+        # so a marked guid is refused (round 1). The same lock the guard takes
+        # around select+send: the selection is shared.
+        marked = self.ctx.guids.get("marked") if self.ctx is not None else None
+        if marked and norm_guid(guid) == norm_guid(marked):
+            self.log("attack %s refused: the CC-marked mob" % norm_guid(guid))
+            return
         with self.agent.action_lock:
             try:
                 self.agent.rpc_must("face", {"guid": guid})
@@ -745,8 +752,7 @@ class Situation:
 
     def cc_targets(self):
         """cc_target: every summon except the marked (crowd-controlled) one."""
-        marked = self.ctx.guids.get("marked")
-        return [g for g in self.summoned if not marked or norm_guid(g) != norm_guid(marked)]
+        return self.unmarked_guids(self.summoned)
 
     def engage_marked(self, timeout=5.0):
         """cc_target: taunt the marked mob into combat before the fight counts.
@@ -861,25 +867,34 @@ class Situation:
                                    "z": unit.get("z", st.get("z", 0))}, timeout="40s")
         return True
 
+    def unmarked_guids(self, guids):
+        """This repeat's guids minus the trial's crowd-controlled mark (cc_target)."""
+        marked = self.ctx.guids.get("marked")
+        return [g for g in guids if not marked or norm_guid(g) != norm_guid(marked)]
+
     def threat(self):
         stance = self.trial["player"].get("stance")
         spell = THREAT_CAST.get(int(stance)) if stance else None
         if not spell:
             return
         try:
-            alive = self.alive_now()
+            alive = self.unmarked_guids(self.alive_now())
         except RpcError as exc:
             # an unreadable unit list is not "nothing alive": fall back to the
             # last summon instead of dropping the 6 s threat tick (the loop's
             # own alive reads skip the tick the same way)
             self.log("threat target unknown (%s)" % exc)
             alive = []
-        guid = alive[0] if alive else (self.summoned[-1] if self.summoned else None)
+        guid = alive[0] if alive else None
+        if guid is None:
+            unmarked = self.unmarked_guids(self.summoned)
+            guid = unmarked[-1] if unmarked else None
         if not guid:
             return
         # face the live summon first (bench-1117, same cause as attack): a dead
         # first summon is skipped, and cast(target=0) still uses the shared
-        # selection, so this holds the same lock as select+send
+        # selection, so this holds the same lock as select+send. The CC-marked
+        # mob is never targeted: threat() must not Taunt the sheep (round 1).
         with self.agent.action_lock:
             try:
                 self.agent.rpc_must("face", {"guid": guid})
@@ -896,21 +911,32 @@ class Situation:
         landed at the wait's end, 17-21 s after the bot's first swing). Poll
         `fighting(self.summoned)` until `wait` s pass, `abort_reason()` is set,
         or a summon is in combat; on combat stamp `fight_start = now` with
-        `during_pull_wait` and the `early_s` left of the wait, and return. Quiet
-        waits stamp nothing.
+        `during_pull_wait` and the `early_s` left of the wait, set `fight_seen` so
+        the loop never calls it "no fight", and return True. A failed unit read is
+        retried on the next poll (transient, like the loop's own alive reads); only
+        the overall deadline or an abort ends the wait (False). Quiet waits stamp
+        nothing.
         """
         entered = time.time()
         while True:
             if self.abort_reason():
-                return
-            if self.fighting(self.summoned):
-                now = time.time()
-                self.fight_start = now
-                self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned],
-                                "during_pull_wait": True, "early_s": round(wait - (now - entered), 1)})
-                return
+                return False
+            try:
+                if self.fighting(self.summoned):
+                    now = time.time()
+                    self.fight_start = now
+                    self.fight_seen = True
+                    self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned],
+                                    "during_pull_wait": True,
+                                    "early_s": max(0.0, round(wait - (now - entered), 1))})
+                    return True
+            except RpcError as exc:
+                # a transient unit-list failure is not "no combat": retry on the next
+                # poll (the loop's own alive reads skip the tick the same way); only
+                # the overall pull_wait deadline ends the wait
+                self.log("pull_wait poll skipped: units unknown (%s)" % exc)
             if time.time() - entered >= wait:
-                return
+                return False
             time.sleep(poll)
 
     def fight_deadline(self, duration):
@@ -1036,7 +1062,10 @@ class Situation:
         ended = ""
         invalid = ""
         gap_start = None          # cc_target: since when no unmarked summon has been alive
-        fight_seen = False        # a summon was seen in combat (the pull worked)
+        fight_seen = bool(getattr(self, "fight_seen", False))
+        # pull_wait() may already have stamped fight_start on early combat: the fight
+        # is seen even when the mob dies or leaves before the first loop tick, so the
+        # rep is never mis-scored as "no fight" (round 1)
         try:
             entered = time.time()
             while True:
