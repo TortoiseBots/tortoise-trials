@@ -234,6 +234,11 @@ def kill_summon(agent, guard, ledger, guid):
 NOT_IN_VIEW = re.compile(r"\bis not in view\b", re.I)
 
 
+def abort_ended(reason):
+    """The `ended` of a repeat an abort ended: the fight loop's own mapping, in one place."""
+    return "disconnected" if "disconnect" in str(reason).lower() else str(reason)
+
+
 def _gone_ok(absent_is_gone, guid):
     """absent_is_gone is a bool for every guid, or the collection of guids it holds for."""
     if isinstance(absent_is_gone, (set, frozenset, list, tuple)):
@@ -912,15 +917,17 @@ class Situation:
         `fighting(self.summoned)` until `wait` s pass, `abort_reason()` is set,
         or a summon is in combat; on combat stamp `fight_start = now` with
         `during_pull_wait` and the `early_s` left of the wait, set `fight_seen` so
-        the loop never calls it "no fight", and return True. A failed unit read is
-        retried on the next poll (transient, like the loop's own alive reads); only
-        the overall deadline or an abort ends the wait (False). Quiet waits stamp
-        nothing.
+        the loop never calls it "no fight", and return "fight". A plain failed unit
+        read is retried on the next poll (transient, like the loop's own alive
+        reads), but the same failure WITH the abort set -- a lost session or lease
+        surfaces as a failed read too -- ends the wait at once and returns
+        "aborted", so `run()` ends the repeat before it sends anything else (round
+        2 HIGH). The deadline returns "quiet". Quiet waits stamp nothing.
         """
         entered = time.time()
         while True:
             if self.abort_reason():
-                return False
+                return "aborted"
             try:
                 if self.fighting(self.summoned):
                     now = time.time()
@@ -929,14 +936,18 @@ class Situation:
                     self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned],
                                     "during_pull_wait": True,
                                     "early_s": max(0.0, round(wait - (now - entered), 1))})
-                    return True
+                    return "fight"
             except RpcError as exc:
+                # the abort is re-checked after the failure: a read that dies with the
+                # session is not a transient poll failure to retry (round 2 HIGH)
+                if self.abort_reason():
+                    return "aborted"
                 # a transient unit-list failure is not "no combat": retry on the next
                 # poll (the loop's own alive reads skip the tick the same way); only
                 # the overall pull_wait deadline ends the wait
                 self.log("pull_wait poll skipped: units unknown (%s)" % exc)
             if time.time() - entered >= wait:
-                return False
+                return "quiet"
             time.sleep(poll)
 
     def fight_deadline(self, duration):
@@ -953,6 +964,19 @@ class Situation:
         if not reason:
             reason = str(getattr(self.collector, "lost", "") or "")
         return reason
+
+    def abort_outcome(self):
+        """The repeat's outcome for an abort found during pull_wait, before any command.
+
+        The fight loop's own abort check maps the reason and stamps `fight_end`; an
+        abort during the wait ends the repeat the same way, so nothing else goes out
+        after the slot is gone (round 2 HIGH).
+        """
+        reason = self.abort_reason() or "disconnected"
+        ended = abort_ended(reason)
+        self.marks.add({"kind": "fight_end", "ended": ended})
+        return {"ok": False, "ended": ended, "mob_source": self.mob_source,
+                "fight_start": self.fight_start, "invalid_reason": reason}
 
     def run(self):
         kind = self.sit.get("kind") or "tank_damage"
@@ -999,7 +1023,10 @@ class Situation:
         if wait:
             # an early stamp stays the fight's own t0: the loop's late stamp (below)
             # must not overwrite it, and the deadline runs from it
-            self.pull_wait(wait)
+            if self.pull_wait(wait) == "aborted":
+                # a session/lease lost during the wait ends the repeat at once: no strip,
+                # pull, attack or debuff apply goes out after the slot is gone
+                return self.abort_outcome()
 
         # the tested debuff is not a setup aura: a copy left over from an earlier repeat (or
         # applied in setup before the stance step's `.unaura all`, rc1116: all 6 reps held 71
@@ -1071,7 +1098,7 @@ class Situation:
             while True:
                 reason = self.abort_reason()
                 if reason:
-                    ended = "disconnected" if "disconnect" in reason.lower() else reason
+                    ended = abort_ended(reason)
                     invalid = reason
                     break
                 now = time.time()

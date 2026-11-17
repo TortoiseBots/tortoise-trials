@@ -117,8 +117,9 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
 - `situation`: how to make the situation, by `kind` (`tank_damage`, `ooc_hurt`, `ooc_buffs`,
   `cc_target` and others): which mobs, a health band to hold the target in, a floor, a pull delay
   (`pull_after_s`: the runner polls through the wait — a failed unit read is retried on the
-  next poll — and stamps `fight_start` at the first combat, so a fight that starts during the
-  wait is the fight; the rep's card line shows `early_fight=<s>s`). `threat()` and `attack()`
+  next poll unless the repeat's session or lease is gone, which ends the repeat at once, before
+  any strip, pull or attack — and stamps `fight_start` at the first combat, so a fight that
+  starts during the wait is the fight; the rep's card line shows `early_fight=<s>s`). `threat()` and `attack()`
   face the live summon first under the shared selection lock (a refused face is logged and the
   cast/attack still goes out), never the trial's crowd-controlled mark (`attack()` refuses it;
   `threat()` takes the next live unmarked summon, or skips).

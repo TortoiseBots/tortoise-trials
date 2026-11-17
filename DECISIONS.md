@@ -28,7 +28,7 @@ unmarked summon, none means return; a dead first summon is skipped), `attack(gui
 would break the cc trial). The Fade order (owner-approved) stays: with the mob held, it should
 stop firing.
 
-`tests/test_bench_fix_1117.py` pins all of it (12 tests; see the docstring). Round 1 of the
+`tests/test_bench_fix_1117.py` pins all of it (15 tests; see the docstring). Round 1 of the
 review (codex + agy adversarial) found four holes, all fixed here: (HIGH) a transient unit-list
 failure inside `pull_wait()` aborted the whole repeat — a failed poll is now retried until the
 wait deadline (the loop's own alive reads skip the tick the same way). (HIGH) `threat()`
@@ -39,6 +39,16 @@ sets `fight_seen` (default False in `__init__`, carried into the loop), and the 
 wiring pin is a behaviour test that runs `Situation.run()` with combat during the wait and the
 mob gone by the first loop tick. The `early_s` clamp (`max(0.0, ...)`, agy low) keeps a late
 `fighting()` RPC from printing a negative `early_fight`.
+
+Round 2 (codex HIGH): the retry swallowed a real abort — a session or lease lost during the wait
+surfaces as that same failed read, `pull_wait()` returned False, and `run()` carried on into
+`strip_debuff`, the pull/attack and the debuff apply before its next abort check, so a slot that
+had lost the lease could still send commands. `pull_wait()` now returns a status: `"fight"` (early
+stamp), `"quiet"` (deadline) or `"aborted"` (the abort re-checked at the loop top AND after a
+failed read), and `run()` ends the repeat on `"aborted"` through `abort_outcome()`: INVALID, the
+reason as `ended` (the loop's own mapping, now the shared `abort_ended()`, so `disconnect` still
+maps to `disconnected`), a `fight_end` mark, and no command after the wait. A plain read failure
+still retries (round 1).
 
 Full suite (`python3 -m unittest discover -s tests` under `nice` + `flock
 /tmp/trials-test.lock`): counts in the round report — new failures 0 vs main's known 16.
