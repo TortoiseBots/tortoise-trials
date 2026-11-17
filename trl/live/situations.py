@@ -941,6 +941,11 @@ class Situation:
         # the trigger; one more apply when the first event never shows. A repeat whose trigger
         # cannot be proven is INVALID, never scored as a no-match. The refresh loop below keeps
         # it up for the whole repeat (same GM path, no new command).
+        # The debuff is the trial's own latency zero, so the fight is stamped BEFORE the apply:
+        # an `aura_on` that lands a moment after the pull is the rule's trigger at t >= 0, not
+        # a pre-fight row the (0, fight_end) latency window drops.
+        if debuff:
+            self.start_fight()
         if debuff and not self.apply_debuff(debuff):
             return {"ok": False, "ended": "debuff",
                     "invalid_reason": "no fresh aura_on for %d after 2 applies" % debuff}
@@ -973,6 +978,7 @@ class Situation:
         ended = ""
         invalid = ""
         gap_start = None          # cc_target: since when no unmarked summon has been alive
+        fight_seen = False        # a summon was seen in combat (the pull worked)
         try:
             entered = time.time()
             while True:
@@ -982,11 +988,15 @@ class Situation:
                     invalid = reason
                     break
                 now = time.time()
-                if not self.fight_start and self.fighting(self.summoned):
-                    self.fight_start = now
-                    self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned]})
-                    deadline = now + duration
-                if not self.fight_start and now - entered > 60.0:
+                if not fight_seen and self.fighting(self.summoned):
+                    fight_seen = True
+                if not self.fight_start and fight_seen:
+                    self.start_fight(now)
+                if self.fight_start and deadline is None:
+                    deadline = self.fight_start + duration
+                if not fight_seen and now - entered > 60.0:
+                    # a debuff rep stamps fight_start before its apply; a pull that never put a
+                    # mob in combat is still no_fight, never a scored rep with no triggers
                     ended = "no_fight"
                     break
                 if governor.ended:
@@ -1427,6 +1437,20 @@ class Situation:
         if invalid:
             return {"ok": False, "ended": "disconnected", "invalid_reason": invalid}
         return {"ok": True, "ended": ended}
+
+    def start_fight(self, now=None):
+        """Stamp the repeat's scored base once: t = 0 for every rule in the rep.
+
+        The pull's first attack starts the fight, so the stamp belongs right after the pull.
+        A situation that applies its own trigger (the tested debuff) must stamp BEFORE that
+        apply: `window_rows` keeps latency rules at (0, fight_end), and an `aura_on` from the
+        apply is dropped as a pre-fight row when fight_start is stamped only on the next tick.
+        """
+        if self.fight_start:
+            return self.fight_start
+        self.fight_start = float(now if now is not None else time.time())
+        self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned]})
+        return self.fight_start
 
     def fighting(self, mobs):
         ids = {norm_guid(g) for g in mobs}

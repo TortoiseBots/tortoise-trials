@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -120,6 +121,25 @@ class PotionCarryoverTest(unittest.TestCase):
         self.assertEqual(rep2["reason"], "item cooldown from rep N-1")
 
 
+class RepOrderTest(unittest.TestCase):
+    def test_score_trial_scores_rep10_after_rep9(self):
+        # agy round 2: a string sort threaded rep10 between rep1 and rep2, so rep2 scored
+        # with rep10's (future) cooldown spans and rep10 with rep9's.
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = os.path.join(tmp, TID)
+            for i in range(1, 11):
+                os.makedirs(os.path.join(tdir, "rep%d" % i))
+            seen = []
+
+            def fake_score(rep_dir, trial, prior_events=None):
+                seen.append(os.path.basename(rep_dir))
+                return {"rep": os.path.basename(rep_dir), "rules": []}
+
+            with unittest.mock.patch.object(score_mod, "score_rep", fake_score):
+                score_mod.score_trial(tdir, {"id": TID, "rules": []})
+        self.assertEqual(seen, ["rep%d" % i for i in range(1, 11)])
+
+
 class PotionMinRepGapTest(unittest.TestCase):
     def test_the_trial_carries_a_documented_min_rep_gap(self):
         trial = load_trial()
@@ -186,6 +206,54 @@ class PotionMinRepGapTest(unittest.TestCase):
             os.makedirs(os.path.join(tmp, TID))
             run, _calls = self._run(tmp)
             self.assertEqual(run.wait_rep_gap(None, trial, 130.0), 0.0)
+
+    def test_a_truncated_last_event_line_does_not_abort_the_run(self):
+        # codex round 2: wait_rep_gap eagerly decoded every line and caught only OSError, so
+        # a half-written last record (a killed collector) raised JSONDecodeError, which the
+        # caller's TypeError/ValueError guard let escape and aborted the whole run. The
+        # truncated record could be the newest potion, so the wait is the full gap.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = load_trial()
+            tdir = os.path.join(tmp, TID)
+            os.makedirs(tdir)
+            rep = write_rep(tdir, "rep1", now - 100.0 - 119.0, [119.0])
+            with open(os.path.join(rep, "events.jsonl"), "a") as f:
+                f.write('{"t": 119.5, "kind": "cast", "sp')
+            run, calls = self._run(tmp)
+            self.assertEqual(self._waited(run, trial, 130.0), 130.0)
+            self.assertTrue(any("unknown" in line for line in calls), calls)
+
+    def test_a_truncated_marks_tail_is_skipped_and_the_potion_still_counted(self):
+        # the potion evidence (events.jsonl) is intact: a truncated marks tail is skipped,
+        # and the normal item-cooldown remainder is waited, not the conservative full gap.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = load_trial()
+            tdir = os.path.join(tmp, TID)
+            os.makedirs(tdir)
+            rep = write_rep(tdir, "rep1", now - 100.0 - 119.0, [119.0])
+            with open(os.path.join(rep, "marks.jsonl"), "a") as f:
+                f.write('{"kind": "fight_end", "wal')
+            run, _calls = self._run(tmp)
+            waited = self._waited(run, trial, 130.0)
+            self.assertGreater(waited, 29.0)
+            self.assertLess(waited, 31.0)
+
+    def test_missing_events_makes_the_potion_state_unknown_and_waits_the_full_gap(self):
+        # a rep dir that died before its events were normalised says nothing about the item
+        # cooldown: conservative full wait, never "no potion, no wait".
+        with tempfile.TemporaryDirectory() as tmp:
+            trial = load_trial()
+            tdir = os.path.join(tmp, TID)
+            os.makedirs(tdir)
+            rep = write_rep(tdir, "rep1", 1_800_000_000.0, [10.0])
+            os.remove(os.path.join(rep, "events.jsonl"))
+            run, calls = self._run(tmp)
+            self.assertEqual(self._waited(run, trial, 130.0), 130.0)
+            self.assertTrue(any("unknown" in line for line in calls), calls)
 
 
 if __name__ == "__main__":

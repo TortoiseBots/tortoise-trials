@@ -74,6 +74,29 @@ fails `validate` without the `min_rep_gap_s` field. Full suite (`python3 -m unit
 910 tests, 11 failures + 5 errors, all 16 pre-existing on origin/main (894 tests, 14 failures + 5 errors;
 the 3 extra there are timing-flaky lease/hire tests that pass alone). New failures on this branch: 0.
 
+**Round 2 of the review: the dispel trial's first trigger, rep order, and a truncated JSONL.** Three
+mediums, all fixed here and covered by fail-first tests. (1) `Situation.run` applied the tested debuff
+before the fight loop stamped `fight_start`, so the first `aura_on` (the apply's own, the one
+`apply_debuff` proves) was stamped at t < 0 and `window_rows` dropped it from the (0, fight_end)
+latency window: the trial's opening trigger was never scored. The pull is the trial's latency zero;
+`Situation.start_fight()` stamps it once, and a debuff situation calls it BEFORE the apply (the loop
+still stamps every other kind on the first in-combat tick). The loop now tracks `fight_seen` instead
+of `fight_start` for the 60 s `no_fight` end, so a debuff rep whose pull never put a mob in combat
+still ends `no_fight` rather than scoring debuff refreshes with no answers.
+`test_the_first_aura_on_lands_inside_the_scored_window` drives a real `collect.Marks` and a fake
+server whose `.aura` event lands a poll later (the live shape) and asserts the event's wall is at or
+after the fight_start wall and `window_rows` keeps it; on the old order it lands 0.2 s before the
+stamp and the window drops it. (2) `score_trial` sorted `rep*` dirs as strings, so `rep10` was
+scored between `rep1` and `rep2` and the cross-rep cooldowns threaded through the wrong neighbours;
+`trl/score.py` now owns `rep_number`/`rep_dirs` and `wait_rep_gap` imports the same order.
+`RepOrderTest` pins rep1..rep10. (3) `wait_rep_gap` decoded every prior JSONL line and caught only
+`OSError`, so a half-written last record raised `JSONDecodeError` past the caller's
+`TypeError`/`ValueError` guard and aborted the run. Lines are parsed tolerantly now: a malformed
+line is skipped and logged, and a rep whose potion state cannot be established (malformed
+`events.jsonl` record, a missing `events.jsonl`/base wall) gets the conservative full
+`min_rep_gap_s` wait instead of 0; a malformed `marks.jsonl` tail is harmless because the base is
+at the head. Three tests pin the crash, the conservative wait and the intact-evidence remainder.
+
 ## 2026-11-14: DPS-MAG-COUNTERSPELL scores pooled (a scoring flip, not a regression)
 
 `DPS-MAG-COUNTERSPELL` (`dps-mage-counterspell-caster`) now carries `pool: true` with

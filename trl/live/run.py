@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 from .. import gear as gear_mod
 from .. import scenario
+from ..score import rep_dirs
 from . import collect, ladder, lease, pacing, situations, teardown
 from .agent import Agent, RpcError, norm_guid
 from .gm_guard import GmAborted, GmContext, GmGuard, GmRefused, GmServerError
@@ -1231,11 +1232,15 @@ class Run:
         `Restore Mana` cast in the newest one with any is the wall clock the item
         cooldown runs from. The dirs are ordered NUMERICALLY (rep2 before rep10: a string
         sort put rep10 first and rep2's older wall overwrote its newer potion) and the
-        newest potion across all of them wins. No potion anywhere yet (or an unreadable
-        rep dir) means no wait. The wait is bounded (one gap, then the rep starts) and
-        logged.
+        newest potion across all of them wins. No potion anywhere yet means no wait.
+
+        A rep dir whose telemetry is unreadable (a partial collector write leaves a
+        truncated JSONL line, or marks/events are missing) has an UNKNOWN cooldown state:
+        its potion may be the newest one, so the wait is the conservative full `gap_s`
+        instead of no wait. A malformed line is skipped and logged, never raised (the
+        caller only catches TypeError/ValueError, so a JSONDecodeError here aborted the
+        whole run). The wait is bounded (one gap, then the rep starts) and logged.
         """
-        import glob as _glob
         import json as _json
         import time as _time
         from datetime import datetime as _dt
@@ -1243,46 +1248,81 @@ class Run:
             return 0.0
         trial_dir = os.path.join(self.run_dir, trial.get("id"))
 
-        def rep_no(path):
-            m = re.search(r"rep(\d+)$", os.path.basename(path))
-            return int(m.group(1)) if m else -1
-        last_wall = None
-        for path in sorted(_glob.glob(os.path.join(trial_dir, "rep*")), key=rep_no):
+        def rows_of(filename):
+            """(rows, bad): one JSONL file's rows and its malformed-line count; None if unreadable.
+
+            An interrupted collector or a killed run leaves a partial last line; that line is
+            skipped (never raised, which used to abort the run) and counted so the caller can
+            treat the rep's cooldown state as unknown.
+            """
             try:
-                with open(os.path.join(path, "marks.jsonl")) as f:
-                    marks = [_json.loads(l) for l in f if l.strip()]
+                with open(os.path.join(path, filename)) as f:
+                    lines = f.readlines()
             except OSError:
-                continue
+                return None
+            rows, bad = [], 0
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    row = _json.loads(line)
+                except ValueError:
+                    bad += 1
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+            return rows, bad
+
+        def wall_secs(row):
+            try:
+                return _dt.fromisoformat(str(row.get("wall"))).timestamp()
+            except (TypeError, ValueError):
+                return None
+
+        last_wall = None
+        unknown = ""
+        for path in rep_dirs(trial_dir):
+            got = rows_of("marks.jsonl")
+            if got is None:
+                unknown = "marks.jsonl unreadable"
+                break
+            marks, _bad = got      # a malformed tail cannot hide the fight_start at its head
             base = None
             for m in marks:
                 if m.get("kind") == "fight_start":
-                    try:
-                        base = _dt.fromisoformat(str(m.get("wall"))).timestamp()
-                    except ValueError:
-                        base = None
+                    base = wall_secs(m)
                     break
             if base is None:
                 for m in marks:
                     if m.get("kind") == "setup_ok":
-                        try:
-                            base = _dt.fromisoformat(str(m.get("wall"))).timestamp()
-                        except ValueError:
-                            base = None
+                        base = wall_secs(m)
                         break
             if base is None:
-                continue
-            try:
-                with open(os.path.join(path, "events.jsonl")) as f:
-                    rows = [_json.loads(l) for l in f if l.strip()]
-            except OSError:
-                continue
-            for row in rows:
+                unknown = "no fight_start/setup_ok wall"
+                break
+            got = rows_of("events.jsonl")
+            if got is None:
+                unknown = "events.jsonl unreadable"
+                break
+            events, bad = got       # a truncated cast could be the newest potion: unknown
+            if bad:
+                unknown = "%d malformed events.jsonl line(s)" % bad
+                break
+            for row in events:
                 if row.get("kind") == "cast" and row.get("spell") == "Restore Mana":
                     try:
                         cast_wall = base + float(row.get("t") or 0.0)
                     except (TypeError, ValueError):
-                        continue
+                        unknown = "cast row without a usable t"
+                        break
                     last_wall = cast_wall if last_wall is None else max(last_wall, cast_wall)
+            if unknown:
+                break
+        if unknown:
+            self.log("%s: unknown potion cooldown (%s); waiting the full min_rep_gap_s %.0f s"
+                     % (trial.get("id"), unknown, gap_s))
+            _time.sleep(float(gap_s))
+            return float(gap_s)
         if last_wall is None:
             return 0.0
         wait = float(gap_s) - (_time.time() - last_wall)

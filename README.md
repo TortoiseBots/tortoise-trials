@@ -122,7 +122,10 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
   Tea's). `min_rep_gap_s` (a number of seconds > 0) waits between the previous repeat's last
   `Restore Mana` potion wall time and the next repeat's start, so a rep never opens inside the
   120 s Greater Mana Potion item cooldown the per-rep `.cooldown` cannot reset (the potion trial
-  carries 130). A rep whose first potion still lands within one cooldown (+1 s sampler grace)
+  carries 130). An earlier rep dir whose telemetry is unusable (a partial last JSONL line, a
+  missing `marks.jsonl`/`events.jsonl`) has an unknown potion state and gets the conservative
+  full `min_rep_gap_s` wait; a malformed line is skipped and logged, never raised. A rep whose
+  first potion still lands within one cooldown (+1 s sampler grace)
   of the previous rep's last potion scores INCONCLUSIVE with reason `item cooldown from rep N-1`,
   never a late-cast miss; only the earliest potion of each rep can be the carried-over one.
   `energy_drain {first_at_s 5-170, every_s >= 20, to 0-19}` (rogue `tank_damage` only)
@@ -135,7 +138,9 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
   `debuff {spell_id: <id>}` is the aura the trial MEASURES (e.g. Faerie Fire 770 for the dispel
   trial). It is applied to the victim in combat after the pull and proven by a fresh `aura_applied`
   event past the pre-send event cursor; one more apply when the event never shows, and a repeat
-  whose trigger cannot be proven is INVALID (`no fresh aura_on for <id> after 2 applies`). Just
+  whose trigger cannot be proven is INVALID (`no fresh aura_on for <id> after 2 applies`). The
+  pull stamps the repeat's `fight_start` (t = 0) BEFORE that apply, so the first `aura_on` lands
+  inside the rule's latency window instead of before it. Just
   before the pull the runner proves it is ABSENT (a copy left from an earlier repeat is refreshed,
   not re-applied, by `.aura`: no fresh event to score) and strips it when it is up; an unreadable
   aura row or an aura still up after `.unaura` makes the repeat INVALID before the pull.

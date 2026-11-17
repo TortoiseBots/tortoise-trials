@@ -14,15 +14,19 @@ Fail-first: each case failed on the base commit (old code) and passes with the f
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import test_live as tl  # noqa: E402
+from trl import rules as rules_mod  # noqa: E402
 from trl.live import agent as agent_mod  # noqa: E402
+from trl.live import collect  # noqa: E402
 from trl.live import setup as setup_mod  # noqa: E402
 from trl.live import situations  # noqa: E402
 
@@ -160,15 +164,26 @@ class DispelRunAgent(tl.FakeAgent):
         self.aura_sends = 0
         self.land_on = 1        # the `.aura` send that emits the fresh `aura_applied`
         self.attacked = []
+        self.aura_ons = []      # (spell_id, wall seconds) of every emitted `aura_applied`
+        self.pending_aura = None   # (spell, target, land_at): the send is on the wire
 
     def emit_aura_on(self, spell_id, target):
         self.seq += 1
+        self.aura_ons.append((int(spell_id), time.time()))
         self.event_rows.append({"seq": self.seq, "kind": "aura_applied", "spell_id": int(spell_id),
                                 "target": {"guid": agent_mod.norm_guid(target)}})
+
+    def land_pending(self):
+        """A GM send is asynchronous: the event shows up a poll later, with its own wall."""
+        pending = self.pending_aura
+        if pending and time.time() >= pending[2]:
+            self.pending_aura = None
+            self.emit_aura_on(pending[0], pending[1])
 
     def rpc(self, method, params=None, timeout=None):
         params = params or {}
         if method == "events":
+            self.land_pending()
             since = params.get("since")
             if since == agent_mod.HEAD_PROBE:
                 return {"events": [], "next": self.seq, "oldest": 0, "dropped": False}
@@ -200,14 +215,16 @@ class OrderGuard:
             if int(spell) not in auras:
                 row["auras"] = [{"spell_id": a} for a in auras + [int(spell)]]
             if self.agent.aura_sends == self.agent.land_on:
-                self.agent.emit_aura_on(int(spell), target)
+                # the server answers a tick later: apply_debuff's wait is real time, so the
+                # event's wall is the landing, not the send
+                self.agent.pending_aura = (int(spell), target, time.time() + 0.05)
         return "sent"
 
 
 class DispelRunOrderTest(unittest.TestCase):
     """The tested debuff is not a setup aura: absent before the pull, fresh after it."""
 
-    def build(self, auras=(), land_on=1):
+    def build(self, auras=(), land_on=1, marks=None):
         agent = DispelRunAgent()
         trial = {"id": "t", "player": {"level": 40, "class": "warrior"},
                  "situation": {"kind": "debuff", "debuff": {"spell_id": 770},
@@ -215,7 +232,8 @@ class DispelRunOrderTest(unittest.TestCase):
         order = []
         guard = OrderGuard(agent, order)
         sit = situations.Situation(agent, trial, guard, tl.new_ledger(tempfile.mkdtemp()),
-                                   tl.FakeMarks(), tl.StubCollector(),
+                                   tl.FakeMarks() if marks is None else marks,
+                                   tl.StubCollector(),
                                    situations.SitContext(player_guid=PLAYER, bot_name="Helper",
                                                          hire_guid=BOT),
                                    arenas=[], mobs={})
@@ -304,6 +322,30 @@ class DispelRunOrderTest(unittest.TestCase):
         self.assertIn("still up", out["invalid_reason"])
         self.assertEqual(agent.attacked, [])
         self.assertTrue(sit.marks.kinds("debuff_strip_failed"))
+
+    def test_the_first_aura_on_lands_inside_the_scored_window(self):
+        # agy round 2: fight_start was stamped by the fight loop AFTER apply_debuff, so the
+        # first `aura_on` (the apply's own, the one apply_debuff proves) got t < 0 and the
+        # (0, fight_end) latency window dropped it. The trial's latency zero is the pull:
+        # stamp the fight before the apply, and the same event is scored.
+        tmp = tempfile.mkdtemp()
+        marks = collect.Marks(os.path.join(tmp, "marks.jsonl"))
+        sit, agent, _order = self.build(marks=marks)
+        agent.unit_list = [dict(agent.unit_rows[MOB])]      # the pull is in combat
+        sit.trial["duration_s"] = 1.5                       # one in-combat tick, then end
+        sit.abort = lambda: ""
+        out = sit.run()
+        self.assertTrue(out["ok"], out)
+        starts = marks.kinds("fight_start")
+        self.assertEqual(len(starts), 1, marks.rows)
+        start_wall = datetime.fromisoformat(starts[0]["wall"]).timestamp()
+        end_wall = datetime.fromisoformat(marks.kinds("fight_end")[0]["wall"]).timestamp()
+        aura_wall = agent.aura_ons[0][1]
+        self.assertGreaterEqual(aura_wall, start_wall)      # t >= 0: not a pre-fight row
+        t = aura_wall - start_wall
+        rows = rules_mod.window_rows([{"kind": "aura_on", "t": t, "spell_id": 770}],
+                                     (0.0, end_wall - start_wall))
+        self.assertEqual(len(rows), 1, (t, end_wall - start_wall))
 
 
 if __name__ == "__main__":
