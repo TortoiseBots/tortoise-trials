@@ -2,6 +2,34 @@
 
 Short, dated notes on choices that are not obvious from the code.
 
+## 2026-11-17: bench fix 1117: a fight that starts during pull_after_s is the fight; the player faces its target
+
+Two bench causes behind the t3-1115b recheck FAILs, both runner-side, never the bot.
+
+**TNK-WAR-RAGE0-BLOODRAGE (41 s median): fight_start was stamped ~20 s after the real fight.**
+`Situation.run()` did `time.sleep(pull_after_s)` (20 s, so the rage decays) before the loop that
+stamped fight_start; the mob aggroed mid-wait, the bot answered with its first swing and Bloodrage
+17-21 s "before" t0, and the scored first cast was the second one, a cooldown later. New
+`Situation.pull_wait()`: polls `fighting(self.summoned)` through the wait and stamps fight_start at
+the first combat (`during_pull_wait`, `early_s` left of the wait); `run()` calls it instead of
+`time.sleep(wait)`. `Situation.fight_deadline(duration)` sets the deadline from that early stamp
+(the loop's own stamp keeps the normal path, guarded by `not self.fight_start`), and the card's
+data-quality line appends `early_fight=<early_s>s` when the rep's fight_start mark carries it.
+Decision: no INVALID for early combat; combat start is the truthful t0. No trial JSON change
+(pull_after_s 20 stays; EMPTY still guards the rage).
+
+**PRI-HEAL-LATENCY 0.707: the GM "tank" never faced the mob.** `threat()` cast on the shared
+selection with target=0 and `attack()` never faced, so the mob sat on the priest while the
+player's Taunt failed `unit_not_infront` (28/29 in one rep) and the priest's own Fade/fear/ragged
+casts ate the 12 misses. Both now `face` the mob first under `action_lock` (RpcError: log and
+continue): `threat()` picks the first guid of `alive_now()` (fallback `summoned[-1]`, none means
+return; a dead first summon is skipped), `attack(guid)` faces before `rpc("attack")`. The Fade
+order (owner-approved) stays: with the mob held, it should stop firing.
+
+`tests/test_bench_fix_1117.py` pins all of it (8 tests; see the docstring). Full suite (`python3 -m
+unittest discover -s tests` under `nice` + `flock /tmp/trials-test.lock`): 918 tests, 11 failures
++ 5 errors — the same 16 names as main 5fcf700, new failures 0.
+
 ## 2026-11-16: bench round 1116: dispel-magic setup order, low-mana-potion carryover gap
 
 Two bench bugs behind the rc1116 recheck, both deterministic setup/scoring artefacts, never the bot.

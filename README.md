@@ -115,7 +115,11 @@ A trial is one JSON file in `trials/<group>/`. Unknown keys are rejected by `val
   `"blue"`): the runner sends `autogear <name> <gear>` after the role setup and fails
   `extra_bots_role` when the reply is not a re-gear (an ungeared tank is a bench artefact).
 - `situation`: how to make the situation, by `kind` (`tank_damage`, `ooc_hurt`, `ooc_buffs`,
-  `cc_target` and others): which mobs, a health band to hold the target in, a floor, a pull delay.
+  `cc_target` and others): which mobs, a health band to hold the target in, a floor, a pull delay
+  (`pull_after_s`: the runner polls through the wait and stamps `fight_start` at the first
+  combat, so a fight that starts during the wait is the fight; the rep's card line shows
+  `early_fight=<s>s`). `threat()` and `attack()` face the live summon first under the shared
+  selection lock (a refused face is logged and the cast/attack still goes out).
   `top_up_to_pct` (a number inside the band, not for ooc kinds) drops the governor's top-up to that
   percent instead of the band middle. `reset_hire_cooldowns: true` clears the hire's cooldowns before
   the first summon (check `hire_cooldowns_reset`; it does NOT clear an item cooldown such as Thistle

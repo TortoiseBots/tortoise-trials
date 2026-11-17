@@ -119,6 +119,25 @@ def _rep_tags(setup):
         tags += "; difficulty step %s" % dif.get("step")
     return tags
 
+def _early_fight(repdir):
+    """'; early_fight=<early_s>s' when the rep's fight started during pull_after_s."""
+    try:
+        with open(os.path.join(repdir, "marks.jsonl")) as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("kind") == "fight_start" and row.get("during_pull_wait"):
+            early = row.get("early_s")
+            return "; early_fight=%ss" % early if early is not None else "; early_fight"
+    return ""
+
 
 def _ladder_line(trial_id, steps):
     """One line per trial when any rep ran easier than written (step > 0), else ''."""
@@ -168,11 +187,12 @@ def write_card(run_dir, run_trials):
                 thr_s = _thr_text(verdicts)
             else:
                 thr_s = "assumed 20/50/70" if _thresholds_assumed(run) else "live"
-            lines.append("- %s %s: setup %s; failed=[%s]; scored=%s s; excluded=%s; %s; %s; events_dropped=[%s]; thresholds=%s%s" % (
+            lines.append("- %s %s: setup %s; failed=[%s]; scored=%s s; excluded=%s; %s; %s; events_dropped=[%s]; thresholds=%s%s%s" % (
                 trial.get("trial"), rep,
                 "ok" if setup.get("ok") else "INVALID (%s)" % (setup.get("invalid_reason") or "?"),
                 ",".join(failed), verdicts.get("scored_s", "?"), excl_s, cut_s, ev, drop_s,
-                thr_s, "; fight_end missing" if verdicts.get("fight_end_missing") else "")
+                thr_s, "; fight_end missing" if verdicts.get("fight_end_missing") else "",
+                _early_fight(repdir))
                 + _rep_tags(setup))
             if isinstance(setup.get("difficulty"), dict):
                 ladder_steps.append((rep, setup["difficulty"]))

@@ -732,8 +732,14 @@ class Situation:
             self.agent.rpc("target", {"guid": guid})
 
     def attack(self, guid):
-        # the same lock the guard takes around select+send: the selection is shared
+        # face first: the GM "tank" never faced the mob, so the mob sat on the
+        # priest while every Taunt failed unit_not_infront (bench-1117). The same
+        # lock the guard takes around select+send: the selection is shared.
         with self.agent.action_lock:
+            try:
+                self.agent.rpc_must("face", {"guid": guid})
+            except RpcError as exc:
+                self.log("face %s skipped: %s" % (norm_guid(guid), exc))
             self.target(guid)
             self.agent.rpc("attack", {})
 
@@ -858,10 +864,60 @@ class Situation:
     def threat(self):
         stance = self.trial["player"].get("stance")
         spell = THREAT_CAST.get(int(stance)) if stance else None
-        if spell:
-            # cast(target=0) uses the shared selection: same lock as select+send
-            with self.agent.action_lock:
-                self.agent.cast(spell, target=0)
+        if not spell:
+            return
+        try:
+            alive = self.alive_now()
+        except RpcError as exc:
+            # an unreadable unit list is not "nothing alive": fall back to the
+            # last summon instead of dropping the 6 s threat tick (the loop's
+            # own alive reads skip the tick the same way)
+            self.log("threat target unknown (%s)" % exc)
+            alive = []
+        guid = alive[0] if alive else (self.summoned[-1] if self.summoned else None)
+        if not guid:
+            return
+        # face the live summon first (bench-1117, same cause as attack): a dead
+        # first summon is skipped, and cast(target=0) still uses the shared
+        # selection, so this holds the same lock as select+send
+        with self.agent.action_lock:
+            try:
+                self.agent.rpc_must("face", {"guid": guid})
+            except RpcError as exc:
+                self.log("face %s skipped: %s" % (norm_guid(guid), exc))
+            self.target(guid)
+            self.agent.cast(spell, target=0)
+
+    def pull_wait(self, wait, poll=0.5):
+        """The pull_after_s wait that keeps stamping fight_start at the first combat.
+
+        A fight that starts DURING the wait is the fight: losing Bloodrage's first
+        cast costs the zero-rage trial its opening ~20 s (bench-1117: fight_start
+        landed at the wait's end, 17-21 s after the bot's first swing). Poll
+        `fighting(self.summoned)` until `wait` s pass, `abort_reason()` is set,
+        or a summon is in combat; on combat stamp `fight_start = now` with
+        `during_pull_wait` and the `early_s` left of the wait, and return. Quiet
+        waits stamp nothing.
+        """
+        entered = time.time()
+        while True:
+            if self.abort_reason():
+                return
+            if self.fighting(self.summoned):
+                now = time.time()
+                self.fight_start = now
+                self.marks.add({"kind": "fight_start", "mobs": [norm_guid(g) for g in self.summoned],
+                                "during_pull_wait": True, "early_s": round(wait - (now - entered), 1)})
+                return
+            if time.time() - entered >= wait:
+                return
+            time.sleep(poll)
+
+    def fight_deadline(self, duration):
+        """The repeat's end on the fight's own clock (None while the fight has no stamp)."""
+        if not self.fight_start:
+            return None
+        return self.fight_start + duration
 
     # -- drivers -----------------------------------------------------------
 
@@ -915,7 +971,9 @@ class Situation:
 
         wait = float(self.sit.get("pull_after_s") or self.sit.get("ooc_wait_s") or 0)
         if wait:
-            time.sleep(wait)
+            # an early stamp stays the fight's own t0: the loop's late stamp (below)
+            # must not overwrite it, and the deadline runs from it
+            self.pull_wait(wait)
 
         # the tested debuff is not a setup aura: a copy left over from an earlier repeat (or
         # applied in setup before the stance step's `.unaura all`, rc1116: all 6 reps held 71
@@ -968,8 +1026,8 @@ class Situation:
                                  stopped=getattr(self.collector, "_stop", None), log=self.log)
             self.collector.tick_hooks.append(guard_gov.tick)
 
-        deadline = None
         duration = float(self.trial.get("duration_s") or 60)
+        deadline = self.fight_deadline(duration)
         refill_every = float(mobs.get("refill_every_s") or 0)
         next_refill = time.time() + refill_every if refill_every else 0.0
         last_threat = 0.0

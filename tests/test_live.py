@@ -1470,10 +1470,14 @@ class LockScopeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             a = A()
             a.action_lock = lock
+            led = new_ledger(tmp)
+            a.unit_list = [{"guid": MOB, "hostile": True, "dead": False, "level": 36}]
+            led.add({"kind": "summon", "guid": MOB})
             s = situations.Situation(a, {"id": "t", "player": {"level": 35, "stance": 71}},
-                                     gm_guard.GmGuard(a, new_ledger(tmp), ctx_for()),
-                                     new_ledger(tmp), FakeMarks(), StubCollector(),
+                                     gm_guard.GmGuard(a, led, ctx_for()),
+                                     led, FakeMarks(), StubCollector(),
                                      situations.SitContext(player_guid=PLAYER), arenas=[], mobs={})
+            s.summoned = [MOB]
             s.threat()
             self.assertEqual([c["spell_id"] for c in a.casts], [355])
             self.assertTrue(a.cast_locked)
