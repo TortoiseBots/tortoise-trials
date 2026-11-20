@@ -430,6 +430,8 @@ No server is contacted. Tests that need the bot source tree, the talent DBC file
 script are skipped unless `TRIALS_BOT_SRC`, `TRIALS_DBC_DIR`, `TRIALS_RULE_BRIEFS` or
 `TRIALS_EVPULL` is set.
 
+This is an unofficial community project made for educational purposes. It is not affiliated with Turtle WoW or Blizzard Entertainment.
+
 ## License
 
 GNU Affero General Public License v3.0 or later, as turtle-agent. See `LICENSE` and `NOTICE`.
