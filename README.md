@@ -36,10 +36,9 @@ generates before/after comparison blocks for pull requests.
 - Run artifacts (`RUN.json`, `events.jsonl`, `setup.json`, `verdicts.json`, `card.md`/`card.json`) are written under
   `./runs` (or `TRIALS_OUT`).
 
-## Documentation (OKF)
+## Documentation
 
-Full documentation is organized as an [Open Knowledge Format (OKF v0.3)](https://github.com/open-knowledge-format/open-knowledge-format)
-bundle under [`knowledge/`](knowledge/index.md) for both humans and AI agents:
+Full documentation lives under [`knowledge/`](knowledge/index.md):
 
 | Area | Topics |
 |---|---|
